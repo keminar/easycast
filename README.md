@@ -141,6 +141,8 @@ D:\Android\platform-tools\adb.exe install -r .\app\build\outputs\apk\debug\app-d
 ```
 看到 `Success` 即完成。IP 换成电视的实际地址。
 
+> **只能用 adb 安装**：实测在这台 Sony 电视（Android 8.0）上，把 APK 拷到 U 盘再用电视的文件管理器安装会报错，装不上，请一律用 adb 安装。debug 版和 release 版的签名不同，互相替换前要先 `adb uninstall com.easycast.tv`。
+
 ### 3. 首次使用
 
 1. 在电视的应用列表里打开 **简易投屏**，**必须手动打开一次**，之后才会开机自启。

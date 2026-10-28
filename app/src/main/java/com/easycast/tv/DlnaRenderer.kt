@@ -183,7 +183,7 @@ class DlnaRenderer(
                 val wait = when {
                     n < 3 -> 400L
                     n < 23 -> 3_000L
-                    else -> 10_000L
+                    else -> 5_000L
                 }
                 n++
                 Thread.sleep(wait)
