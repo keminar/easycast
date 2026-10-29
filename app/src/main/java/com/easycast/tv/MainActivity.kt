@@ -220,7 +220,9 @@ class MainActivity : Activity(), DlnaService.Ui {
         status.visibility = View.GONE
 
         val ip = if (svc!!.localIp == "0.0.0.0") "未获取" else svc.localIp
-        infoView.text = "设备名：${svc.deviceName}        网络：${svc.networkLabel()}        IP：$ip"
+        infoView.text = "设备名：${svc.deviceName}        网络：${svc.networkLabel()}        IP：$ip" +
+            if (svc.localIp == "0.0.0.0") "" else
+                "\n电脑浏览器推送：http://${svc.localIp}:${DlnaRenderer.HTTP_PORT}        口令：${svc.webPin}"
         noticeView.text = notice
         noticeView.visibility = if (notice != null) View.VISIBLE else View.GONE
 

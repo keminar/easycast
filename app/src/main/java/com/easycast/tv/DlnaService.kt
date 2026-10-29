@@ -47,11 +47,16 @@ class DlnaService : Service(), RendererListener {
         private const val PREFS = "easycast"
         private const val KEY_NAME = "device_name"
         const val MAX_NAME_LENGTH = 30
+        private const val KEY_PIN = "web_pin"
         private const val KEY_CASTS = "recent_casts"
         private const val MAX_CASTS = 5
     }
 
     var deviceName: String = DEFAULT_NAME
+        private set
+
+    /** Code needed by the browser page that pushes URLs to this TV; created once, shown on screen. */
+    var webPin: String = ""
         private set
 
     /** One received cast: when it arrived and the stream URL the phone sent. */
@@ -145,7 +150,10 @@ class DlnaService : Service(), RendererListener {
 
         deviceName = getSharedPreferences(PREFS, MODE_PRIVATE)
             .getString(KEY_NAME, null)?.takeIf { it.isNotBlank() } ?: DEFAULT_NAME
-        renderer = DlnaRenderer(this, deviceName, this)
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        webPin = prefs.getString(KEY_PIN, null)?.takeIf { it.length == 4 }
+            ?: (1000..9999).random().toString().also { prefs.edit().putString(KEY_PIN, it).apply() }
+        renderer = DlnaRenderer(this, deviceName, webPin, this)
         renderer.start()
         AppLog.i("服务已启动：设备名 $deviceName，IP ${renderer.localIp}")
         watchNetwork()
@@ -368,6 +376,8 @@ class DlnaService : Service(), RendererListener {
     override fun onSeek(ms: Long) {
         main.post { if (player.isCurrentMediaItemSeekable) player.seekTo(ms) }
     }
+
+    override fun recentUrls() = recentCasts().map { it.time to it.url }
 
     override fun transportState() = cState
     override fun positionMs() = cPos

@@ -22,6 +22,8 @@ interface RendererListener {
     fun onPause()
     fun onStop()
     fun onSeek(ms: Long)
+    /** Recent cast URLs (epoch millis, url), newest first; shown on the web page. */
+    fun recentUrls(): List<Pair<Long, String>>
     /** One of PLAYING, PAUSED_PLAYBACK, STOPPED, TRANSITIONING. */
     fun transportState(): String
     fun positionMs(): Long
@@ -35,6 +37,8 @@ interface RendererListener {
 class DlnaRenderer(
     context: Context,
     @Volatile var friendlyName: String,
+    /** Code the web page must send; shown on the TV screen. */
+    @Volatile var webPin: String,
     private val listener: RendererListener,
 ) {
     companion object {
@@ -298,6 +302,7 @@ class DlnaRenderer(
             if (parts.size < 2) return
             val method = parts[0]
             val path = parts[1].substringBefore('?')
+            val query = parts[1].substringAfter('?', "")
             // Only the device description from other devices is interesting; the TV's own system
             // keeps re-reading it (and the service files) every second.
             val from = it.inetAddress.hostAddress
@@ -332,6 +337,12 @@ class DlnaRenderer(
 
             val xml = "text/xml; charset=\"utf-8\""
             when {
+                method == "GET" && (path == "/" || path == "/index.html") ->
+                    reply("200 OK", "text/html; charset=utf-8", WebPage.html)
+                path.startsWith("/api/") -> {
+                    val (code, json) = handleApi(path, parseForm("$query&$body"), from)
+                    reply(code, "application/json; charset=utf-8", json)
+                }
                 method == "GET" && path == "/desc.xml" -> reply("200 OK", xml, deviceXml())
                 method == "GET" && path == "/AVTransport.xml" -> reply("200 OK", xml, scpd(avActions))
                 method == "GET" && path == "/RenderingControl.xml" -> reply("200 OK", xml, scpd(rcActions))
@@ -354,6 +365,62 @@ class DlnaRenderer(
                 }
                 else -> reply("404 Not Found", "text/plain", "not found")
             }
+        }
+    }
+
+    // ---------------------------------------------------------------- web page API
+
+    private var pinFails = 0
+    private var pinLockedUntil = 0L
+
+    private fun parseForm(s: String): Map<String, String> =
+        s.split('&').filter { '=' in it }.associate {
+            val k = java.net.URLDecoder.decode(it.substringBefore('='), "UTF-8")
+            val v = java.net.URLDecoder.decode(it.substringAfter('='), "UTF-8")
+            k to v
+        }
+
+    private fun json(s: String) = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"")
+        .replace("\n", "\\n").replace("\r", "") + "\""
+
+    private fun error(msg: String) = "{\"error\":${json(msg)}}"
+
+    /** Returns (HTTP status, JSON body). The page must send the PIN shown on the TV with every call. */
+    private fun handleApi(path: String, params: Map<String, String>, from: String?): Pair<String, String> {
+        synchronized(this) {
+            if (System.currentTimeMillis() < pinLockedUntil) return "429 Too Many Requests" to error("口令错误次数过多，请 1 分钟后再试")
+            if (webPin.isNotEmpty() && params["pin"] != webPin) {
+                AppLog.w("网页推送口令错误，来自 $from")
+                if (++pinFails >= 5) {
+                    pinFails = 0
+                    pinLockedUntil = System.currentTimeMillis() + 60_000
+                }
+                return "403 Forbidden" to error("口令不对")
+            }
+            pinFails = 0
+        }
+        return when (path) {
+            "/api/state" ->
+                "200 OK" to "{\"state\":${json(listener.transportState())},\"uri\":${json(currentUri)}," +
+                    "\"device\":${json(friendlyName)},\"ip\":${json(localIp)}}"
+            "/api/recent" ->
+                "200 OK" to listener.recentUrls().joinToString(",", "[", "]") { (t, u) -> "{\"time\":$t,\"url\":${json(u)}}" }
+            "/api/play" -> {
+                val url = params["url"]?.trim().orEmpty()
+                if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                    "400 Bad Request" to error("地址要以 http:// 或 https:// 开头")
+                } else {
+                    AppLog.i("网页推送：$url  来自 $from")
+                    currentUri = url
+                    listener.onSetUri(url)
+                    listener.onPlay()
+                    "200 OK" to "{\"ok\":true}"
+                }
+            }
+            "/api/pause" -> { AppLog.i("网页操作：暂停"); listener.onPause(); "200 OK" to "{\"ok\":true}" }
+            "/api/resume" -> { AppLog.i("网页操作：继续"); listener.onPlay(); "200 OK" to "{\"ok\":true}" }
+            "/api/stop" -> { AppLog.i("网页操作：停止"); listener.onStop(); "200 OK" to "{\"ok\":true}" }
+            else -> "404 Not Found" to error("没有这个接口")
         }
     }
 
