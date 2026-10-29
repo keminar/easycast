@@ -2,7 +2,6 @@ package com.easycast.tv
 
 import android.content.Context
 import android.media.AudioManager
-import android.util.Log
 import java.io.BufferedInputStream
 import java.io.InputStream
 import java.net.DatagramPacket
@@ -63,6 +62,10 @@ class DlnaRenderer(
     /** Bumped on every (re)start so threads of an old run exit instead of lingering. */
     @Volatile private var gen = 0
     @Volatile private var currentUri = ""
+    /** The network went away at some point since the last (re)start: sockets/multicast state may be stale. */
+    @Volatile private var sawDown = false
+    /** A socket thread died or sends keep failing: needs a restart once a network is available. */
+    @Volatile private var failed = false
 
     var localIp: String = "0.0.0.0"
         private set
@@ -77,6 +80,8 @@ class DlnaRenderer(
         val (n, ip) = findInterface()
         nif = n
         localIp = ip ?: "0.0.0.0"
+        sawDown = false
+        failed = false
         running = true
         val g = ++gen
         pool = Executors.newCachedThreadPool()
@@ -102,11 +107,19 @@ class DlnaRenderer(
         start()
     }
 
-    /** Call when Wi-Fi/Ethernet changes: re-announce on the new address. */
+    /** The connection dropped. Remember it so the next reconnect rebuilds sockets even with the same IP. */
+    fun onNetworkLost() {
+        sawDown = true
+    }
+
+    /**
+     * Call when a network comes up. Restarts (re-binds sockets, re-joins multicast, re-announces) if the
+     * address changed, or if we lost the connection / a socket failed since the last start.
+     */
     fun onNetworkChanged() {
         if (!running) return
         val (_, ip) = findInterface()
-        if (ip != null && ip != localIp) restart()
+        if (ip != null && (ip != localIp || sawDown || failed)) restart()
     }
 
     // ---------------------------------------------------------------- network
@@ -149,7 +162,7 @@ class DlnaRenderer(
                 val st = Regex("(?im)^ST:\\s*(.+?)\\s*$").find(text)?.groupValues?.get(1) ?: continue
                 val replies = if (st.equals("ssdp:all", true)) targets
                 else targets.filter { it.equals(st, true) }
-                Log.i("EM", "M-SEARCH from ${p.address.hostAddress} ST=$st -> ${replies.size} replies")
+                AppLog.i("收到搜索 ${p.address.hostAddress}  ST=$st  回应 ${replies.size} 条")
                 val addr = p.address
                 val port = p.port
                 val packets = replies.map { t ->
@@ -168,17 +181,27 @@ class DlnaRenderer(
                 }
             }
         } catch (e: Exception) {
-            if (running && gen == g) e.printStackTrace()
+            if (running && gen == g) {
+                // The SSDP socket is dead (network dropped, bind/join failed); the watchdog restarts us.
+                failed = true
+                AppLog.w("SSDP 搜索线程已停止: ${e.message}，将自动重启")
+            }
         }
     }
 
     private fun runAlive(g: Int) {
         try {
             // Wait until the SSDP socket is bound, otherwise the first announcements are lost.
-            while (running && gen == g && ssdpSocket == null) Thread.sleep(50)
+            while (running && gen == g && ssdpSocket == null && !failed) Thread.sleep(50)
             var n = 0
             while (running && gen == g) {
-                sendNotify("ssdp:alive")
+                // A failed send (e.g. network unreachable while Wi-Fi is down) must not kill this loop.
+                try {
+                    sendNotify("ssdp:alive")
+                } catch (e: Exception) {
+                    failed = true
+                    AppLog.w("广播通知发送失败: ${e.message}")
+                }
                 // Dense announcements at first so controllers see us immediately, then keep-alives.
                 val wait = when {
                     n < 3 -> 400L
@@ -189,10 +212,21 @@ class DlnaRenderer(
                 Thread.sleep(wait)
                 // Re-send the IGMP membership report so a snooping switch keeps forwarding multicast to us.
                 if (n % 5 == 0) rejoinGroup()
+
+                // Watchdog: recover even if the system never delivered a connectivity callback.
+                val (_, ip) = findInterface()
+                if (ip == null) {
+                    sawDown = true
+                } else if (ip != localIp || sawDown || failed) {
+                    AppLog.i("网络恢复/变化 ($localIp -> $ip)，重启投屏服务")
+                    // Restart from a fresh thread: stop() shuts down this very pool.
+                    Thread { restart() }.start()
+                    return
+                }
             }
         } catch (_: InterruptedException) {
         } catch (e: Exception) {
-            if (running && gen == g) e.printStackTrace()
+            if (running && gen == g) AppLog.e("服务线程异常: ${e.message}")
         }
     }
 
@@ -241,7 +275,7 @@ class DlnaRenderer(
                 pool.execute { handle(c) }
             }
         } catch (e: Exception) {
-            if (running && gen == g) e.printStackTrace()
+            if (running && gen == g) AppLog.e("服务线程异常: ${e.message}")
         }
     }
 
@@ -264,7 +298,10 @@ class DlnaRenderer(
             if (parts.size < 2) return
             val method = parts[0]
             val path = parts[1].substringBefore('?')
-            Log.i("EM", "HTTP $method $path from ${it.inetAddress.hostAddress}")
+            // Only the device description from other devices is interesting; the TV's own system
+            // keeps re-reading it (and the service files) every second.
+            val from = it.inetAddress.hostAddress
+            if (path == "/desc.xml" && from != localIp) AppLog.i("设备描述请求 来自 $from")
             val headers = HashMap<String, String>()
             while (true) {
                 val l = readLine(inp) ?: break
@@ -346,7 +383,9 @@ class DlnaRenderer(
 
     /** Returns inner XML of the response, or null if the action is unknown. */
     private fun dispatch(service: String, action: String, body: String): String? {
-        Log.i("EM", "SOAP $action ${if (action == "SetAVTransportURI") arg(body, "CurrentURI") else ""}")
+        if (action != "GetPositionInfo" && action != "GetTransportInfo") {
+            AppLog.i("控制命令 $action ${if (action == "SetAVTransportURI") arg(body, "CurrentURI") else ""}")
+        }
         when (service) {
             AV -> return when (action) {
                 "SetAVTransportURI" -> {

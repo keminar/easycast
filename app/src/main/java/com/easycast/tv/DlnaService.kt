@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -41,13 +42,37 @@ class DlnaService : Service(), RendererListener {
         @Volatile var instance: DlnaService? = null
         private const val CHANNEL = "easycast"
         const val DEFAULT_NAME = "EasyCast"
+        /** Status meaning "idle, nothing to report"; any other idle status is a notice for the user. */
+        const val IDLE_STATUS = "\u0000idle"
         private const val PREFS = "easycast"
         private const val KEY_NAME = "device_name"
         const val MAX_NAME_LENGTH = 30
+        private const val KEY_CASTS = "recent_casts"
+        private const val MAX_CASTS = 5
     }
 
     var deviceName: String = DEFAULT_NAME
         private set
+
+    /** One received cast: when it arrived and the stream URL the phone sent. */
+    data class Cast(val time: Long, val url: String)
+
+    /** The last few cast URLs, newest first. Kept on disk so they survive a restart. */
+    fun recentCasts(): List<Cast> =
+        (getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_CASTS, null) ?: "")
+            .lines()
+            .mapNotNull { line ->
+                val time = line.substringBefore('|', "").toLongOrNull() ?: return@mapNotNull null
+                val url = line.substringAfter('|', "").takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                Cast(time, url)
+            }
+
+    private fun recordCast(url: String) {
+        val list = listOf(Cast(System.currentTimeMillis(), url)) + recentCasts().filter { it.url != url }
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putString(KEY_CASTS, list.take(MAX_CASTS).joinToString("\n") { "${it.time}|${it.url}" })
+            .apply()
+    }
 
     private val main = Handler(Looper.getMainLooper())
     lateinit var player: ExoPlayer
@@ -88,6 +113,11 @@ class DlnaService : Service(), RendererListener {
             .build()
         player.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
+                when (state) {
+                    Player.STATE_BUFFERING -> AppLog.i("播放器：缓冲中…")
+                    Player.STATE_READY -> AppLog.i("播放器：已就绪，开始出画面")
+                    Player.STATE_ENDED -> AppLog.i("播放器：播放结束")
+                }
                 if (state == Player.STATE_READY) setStatus(null)
             }
 
@@ -97,10 +127,13 @@ class DlnaService : Service(), RendererListener {
                 // Portrait streams may be signalled as rotated 90/270.
                 val rotated = size.unappliedRotationDegrees % 180 != 0
                 aspect = if (w <= 0f || h <= 0f) 0f else if (rotated) h / w else w / h
+                if (size.width > 0) AppLog.i("视频画面 ${size.width}x${size.height}${if (rotated) "（旋转）" else ""}")
                 ui?.onAspect(aspect)
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                val cause = error.cause?.message ?: error.message
+                AppLog.e("播放失败 ${error.errorCodeName}: $cause")
                 setStatus("播放失败：${error.errorCodeName}\n请回到抖音重新点击投屏")
             }
         })
@@ -114,6 +147,7 @@ class DlnaService : Service(), RendererListener {
             .getString(KEY_NAME, null)?.takeIf { it.isNotBlank() } ?: DEFAULT_NAME
         renderer = DlnaRenderer(this, deviceName, this)
         renderer.start()
+        AppLog.i("服务已启动：设备名 $deviceName，IP ${renderer.localIp}")
         watchNetwork()
         setStatus(idleText())
         instance = this
@@ -127,6 +161,12 @@ class DlnaService : Service(), RendererListener {
     override fun onDestroy() {
         instance = null
         main.removeCallbacksAndMessages(null)
+        networkCallback?.let {
+            try {
+                (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(it)
+            } catch (_: IllegalArgumentException) {
+            }
+        }
         renderer.stop()
         player.release()
         multicastLock?.release()
@@ -149,15 +189,30 @@ class DlnaService : Service(), RendererListener {
             .build()
     }
 
-    /** Re-announce on a new IP when Wi-Fi/Ethernet reconnects. */
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    /** Rebuild the DLNA sockets when Wi-Fi/Ethernet drops and comes back (even with the same IP). */
     private fun watchNetwork() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        cm.registerNetworkCallback(NetworkRequest.Builder().build(), object : ConnectivityManager.NetworkCallback() {
+        val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                AppLog.i("网络已连接")
                 main.removeCallbacks(netChanged)
                 main.postDelayed(netChanged, 1500)
             }
-        })
+
+            override fun onLost(network: Network) {
+                AppLog.w("网络已断开")
+                main.post {
+                    renderer.onNetworkLost()
+                    if (cm.activeNetwork == null && player.playbackState == Player.STATE_IDLE) {
+                        setStatus("网络已断开，等待重新连接 Wi-Fi 或网线…")
+                    }
+                }
+            }
+        }
+        networkCallback = cb
+        cm.registerNetworkCallback(NetworkRequest.Builder().build(), cb)
     }
 
     private val netChanged = Runnable {
@@ -167,9 +222,30 @@ class DlnaService : Service(), RendererListener {
         }.start()
     }
 
+    /** Name of the network the TV is on: the Wi-Fi SSID, or "有线网络" for Ethernet. */
+    @Suppress("DEPRECATION")
+    fun networkLabel(): String {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) } ?: return "未连接"
+        return when {
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "有线网络"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> {
+                val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                val ssid = wifi.connectionInfo?.ssid?.trim('"')
+                if (ssid.isNullOrEmpty() || ssid == "<unknown ssid>") "Wi-Fi（名称未知）" else "Wi-Fi：$ssid"
+            }
+            else -> "其他网络"
+        }
+    }
+
+    val localIp: String get() = renderer.localIp
+
+    /**
+     * Idle status: [IDLE_STATUS] when all is well (the activity draws device name, network and IP itself),
+     * or a short notice shown under the header when there is no network.
+     */
     fun idleText() =
-        "简易投屏 接收端\n\n设备名：$deviceName\nIP：${renderer.localIp}\n\n" +
-            "打开抖音直播间 → 点击「投屏」→ 选择本设备\n\n按遥控器「确认键」可修改设备名称"
+        if (renderer.localIp == "0.0.0.0") "网络未连接，等待连接 Wi-Fi 或网线…" else IDLE_STATUS
 
     /** Saves the new name and re-announces the device under it. Main thread. */
     fun renameDevice(newName: String) {
@@ -179,6 +255,7 @@ class DlnaService : Service(), RendererListener {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_NAME, name).apply()
         renderer.friendlyName = name
         // Network I/O must stay off the main thread; byebye + alive makes controllers refresh the name.
+        AppLog.i("设备名已改为：$name")
         Thread { renderer.restart() }.start()
         if (player.playbackState == Player.STATE_IDLE) setStatus(idleText())
     }
@@ -197,6 +274,7 @@ class DlnaService : Service(), RendererListener {
     }
 
     fun stopPlayback() {
+        AppLog.i("停止播放")
         player.stop()
         player.clearMediaItems()
         aspect = 0f
@@ -206,6 +284,7 @@ class DlnaService : Service(), RendererListener {
 
     fun pausePlayback() {
         if (player.playbackState == Player.STATE_IDLE) return
+        AppLog.i("暂停")
         player.playWhenReady = false
         pausedAt = SystemClock.elapsedRealtime()
         if (player.playbackState == Player.STATE_READY) setStatus("⏸ 已暂停")
@@ -222,6 +301,7 @@ class DlnaService : Service(), RendererListener {
             setStatus("正在回到直播…")
         }
         pausedAt = 0
+        AppLog.i("继续播放")
         player.playWhenReady = true
         if (player.playbackState == Player.STATE_READY) setStatus(null)
     }
@@ -248,14 +328,29 @@ class DlnaService : Service(), RendererListener {
 
     override fun onSetUri(uri: String) {
         main.post {
-            currentUri = uri
-            pausedAt = 0
-            player.setMediaItem(MediaItem.fromUri(uri))
-            player.playWhenReady = false
-            player.prepare()
-            setStatus("正在加载直播…")
+            load(uri, autoPlay = false)
             bringUiToFront()
         }
+    }
+
+    /**
+     * Load a stream. A phone's SetAVTransportURI waits for its own Play command ([autoPlay] false);
+     * replaying from the on-screen list starts right away.
+     */
+    private fun load(url: String, autoPlay: Boolean) {
+        currentUri = url
+        recordCast(url)
+        pausedAt = 0
+        player.setMediaItem(MediaItem.fromUri(url))
+        player.playWhenReady = autoPlay
+        player.prepare()
+        setStatus("正在加载直播…")
+    }
+
+    /** Play a URL from the recent-casts list again. Main thread. */
+    fun replay(url: String) {
+        AppLog.i("重新播放：$url")
+        load(url, autoPlay = true)
     }
 
     override fun onPlay() {
