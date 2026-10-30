@@ -21,10 +21,14 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
+import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * Keeps the DLNA renderer alive in the background (and after boot) so the TV shows up in
@@ -48,6 +52,7 @@ class DlnaService : Service(), RendererListener {
         private const val KEY_NAME = "device_name"
         const val MAX_NAME_LENGTH = 30
         private const val KEY_PIN = "web_pin"
+        private const val KEY_PIN_DAY = "web_pin_day" // yyyyMMdd on which the PIN was created
         private const val KEY_CASTS = "recent_casts"
         private const val MAX_CASTS = 5
     }
@@ -98,6 +103,7 @@ class DlnaService : Service(), RendererListener {
     @Volatile private var cState = "STOPPED"
     @Volatile private var cPos = 0L
     @Volatile private var cDur = 0L
+    @Volatile private var cSeekable = false
 
     override fun onCreate() {
         super.onCreate()
@@ -113,7 +119,8 @@ class DlnaService : Service(), RendererListener {
             .setBufferDurationsMs(1000, 8000, 500, 1000)
             .build()
         player = ExoPlayer.Builder(this)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(http))
+            // DefaultDataSource routes http(s) to `http` and rtmp:// to the RTMP data source.
+            .setMediaSourceFactory(DefaultMediaSourceFactory(DefaultDataSource.Factory(this, http)))
             .setLoadControl(loadControl)
             .build()
         player.addListener(object : Player.Listener {
@@ -152,7 +159,9 @@ class DlnaService : Service(), RendererListener {
             .getString(KEY_NAME, null)?.takeIf { it.isNotBlank() } ?: DEFAULT_NAME
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         webPin = prefs.getString(KEY_PIN, null)?.takeIf { it.length == 4 }
-            ?: (1000..9999).random().toString().also { prefs.edit().putString(KEY_PIN, it).apply() }
+            ?: (1000..9999).random().toString().also {
+                prefs.edit().putString(KEY_PIN, it).putString(KEY_PIN_DAY, today()).apply()
+            }
         renderer = DlnaRenderer(this, deviceName, webPin, this)
         renderer.start()
         AppLog.i("服务已启动：设备名 $deviceName，IP ${renderer.localIp}")
@@ -160,6 +169,7 @@ class DlnaService : Service(), RendererListener {
         setStatus(idleText())
         instance = this
         main.post(ticker)
+        checkPin() // the one automatic check: when the app starts
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
@@ -255,6 +265,32 @@ class DlnaService : Service(), RendererListener {
     fun idleText() =
         if (renderer.localIp == "0.0.0.0") "网络未连接，等待连接 Wi-Fi 或网线…" else IDLE_STATUS
 
+    private fun today(): String = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+
+    /** Replaces the web PIN with a new random one (different from the old). The old one stops working at once. */
+    fun regeneratePin(reason: String = "手动更换") {
+        val pin = PinPolicy.newPin(webPin)
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putString(KEY_PIN, pin).putString(KEY_PIN_DAY, today()).apply()
+        webPin = pin
+        renderer.webPin = pin
+        AppLog.i("网页口令已更换（$reason）")
+        if (player.playbackState == Player.STATE_IDLE) setStatus(idleText()) // redraws the header with the new PIN
+    }
+
+    /**
+     * Replaces the PIN if it was made on an earlier day (see [PinPolicy.rotationDue]).
+     *
+     * By design this runs only when the app is started (the service starting, or the app being opened from
+     * the launcher), never on a timer: an app left running keeps its PIN. Main thread.
+     */
+    fun checkPin() {
+        val saved = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_PIN_DAY, null)
+        if (PinPolicy.rotationDue(saved, today(), playing = player.playbackState != Player.STATE_IDLE)) {
+            regeneratePin("每天自动更换")
+        }
+    }
+
     /** Saves the new name and re-announces the device under it. Main thread. */
     fun renameDevice(newName: String) {
         val name = newName.trim().take(MAX_NAME_LENGTH)
@@ -328,6 +364,7 @@ class DlnaService : Service(), RendererListener {
             }
             cPos = player.currentPosition.coerceAtLeast(0)
             cDur = if (player.duration == C.TIME_UNSET) 0 else player.duration
+            cSeekable = player.playbackState != Player.STATE_IDLE && player.isCurrentMediaItemSeekable
             main.postDelayed(this, 500)
         }
     }
@@ -377,9 +414,24 @@ class DlnaService : Service(), RendererListener {
         main.post { if (player.isCurrentMediaItemSeekable) player.seekTo(ms) }
     }
 
+    /**
+     * Jump forward or back by [deltaMs] (negative = back). Main thread.
+     * Returns false when the current stream cannot be seeked (live streams, no Range support).
+     */
+    fun seekBy(deltaMs: Long): Boolean {
+        if (player.playbackState == Player.STATE_IDLE || !player.isCurrentMediaItemSeekable) return false
+        val dur = player.duration
+        var target = (player.currentPosition + deltaMs).coerceAtLeast(0)
+        // Stay a second short of the end so a seek to "the end" does not just stop playback.
+        if (dur != C.TIME_UNSET) target = target.coerceAtMost((dur - 1000).coerceAtLeast(0))
+        player.seekTo(target)
+        return true
+    }
+
     override fun recentUrls() = recentCasts().map { it.time to it.url }
 
     override fun transportState() = cState
     override fun positionMs() = cPos
     override fun durationMs() = cDur
+    override fun seekable() = cSeekable
 }

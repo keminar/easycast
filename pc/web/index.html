@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EasyCast 电脑端</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.55 system-ui, "Microsoft YaHei", sans-serif; background: #111; color: #eee; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 22px 16px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: #999; font-size: 13px; margin-bottom: 18px; }
+  .card { background: #1a1a1a; border: 1px solid #292929; border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+  .card h2 { font-size: 16px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+  label { display: block; margin: 10px 0 4px; font-size: 13px; color: #aaa; }
+  input { width: 100%; padding: 9px 11px; border-radius: 8px; border: 1px solid #333; background: #111; color: #eee; font: inherit; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; align-items: center; }
+  .row input { flex: 1; min-width: 160px; }
+  button { padding: 9px 16px; border-radius: 8px; border: 0; background: #333; color: #fff; font: inherit; cursor: pointer; }
+  button:hover { background: #444; }
+  button.primary { background: #1e88e5; } button.primary:hover { background: #3b99ee; }
+  button.danger { background: #8a2c2c; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #666; display: inline-block; }
+  .dot.ok { background: #4cd964; } .dot.bad { background: #ff5a5a; } .dot.wait { background: #ffcc00; }
+  .muted { color: #999; font-size: 13px; }
+  code { background: #111; border: 1px solid #2c2c2c; border-radius: 6px; padding: 2px 7px; color: #8ab4f8; user-select: all; }
+  #msg { min-height: 22px; margin-top: 4px; font-size: 14px; }
+  .ok { color: #7bd88f; } .err { color: #ff7b7b; }
+  ol { margin: 6px 0 0; padding-left: 20px; color: #bbb; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>EasyCast 电脑端</h1>
+  <div class="sub">把本地视频、OBS 画面推送到电视上的「简易投屏」</div>
+  <div id="msg"></div>
+
+  <div class="card">
+    <h2><span id="tvdot" class="dot"></span> 电视</h2>
+    <div class="muted" id="tvinfo">未设置</div>
+    <label for="tvaddr">电视地址（电视主界面「电脑浏览器推送」那一行；跨网段时填路由器的转发地址，如 192.168.1.3:8200）</label>
+    <input id="tvaddr" placeholder="192.168.5.57:8200" autocomplete="off">
+    <label for="tvpin">口令（电视主界面上显示的 4 位数）</label>
+    <input id="tvpin" inputmode="numeric" maxlength="8" placeholder="4 位口令" autocomplete="off">
+    <div class="row"><button id="save" class="primary">保存并连接</button></div>
+  </div>
+
+  <div class="card">
+    <h2>本地视频</h2>
+    <div class="row">
+      <input id="path" placeholder="D:\视频\电影.mp4（可直接粘贴路径）">
+      <button id="pick">浏览…</button>
+      <button id="playfile" class="primary">推送到电视</button>
+    </div>
+    <div class="muted" style="margin-top:8px">电视会直接从这台电脑拉取原文件，不转码，可拖动进度、暂停。</div>
+    <div id="linkbox" style="display:none; margin-top:12px">
+      <div class="muted">播放地址（选好文件就生成，其它设备也能用）：</div>
+      <div class="row">
+        <code id="fileurl" style="flex:1; word-break:break-all"></code>
+        <button id="copy">复制</button>
+        <button id="open">在浏览器打开</button>
+      </div>
+      <div class="muted" style="margin-top:6px">同一局域网里的电脑、手机，或 VLC 的「打开网络串流」都能直接播放；浏览器通常只能播 H.264 + AAC 的 MP4。地址只在本程序运行期间有效，换文件或重启后会变。</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2><span id="livedot" class="dot"></span> OBS 直播（例如腾讯视频客户端的画面）</h2>
+    <ol>
+      <li>OBS → 设置 → 推流：服务选「自定义」，服务器填 <code id="rtmp">…</code>，推流密钥填 <code>tv</code></li>
+      <li>输出用 <b>H.264 + AAC</b>，关键帧间隔 1～2 秒，码率 3000～6000 Kbps</li>
+      <li>开始推流后，点下面的按钮</li>
+    </ol>
+    <div class="muted" id="liveinfo" style="margin-top:8px"></div>
+    <div class="row"><button id="playlive" class="primary">把 OBS 画面推到电视</button></div>
+  </div>
+
+  <div class="card">
+    <h2>播放控制</h2>
+    <div class="row">
+      <button id="pause">暂停</button>
+      <button id="resume">继续</button>
+      <button id="stop" class="danger">停止</button>
+    </div>
+    <div class="row" style="flex-wrap:nowrap">
+      <span id="pos" class="muted" style="min-width:56px;text-align:center">--:--</span>
+      <input id="bar" type="range" min="0" max="1000" value="0" disabled style="padding:0">
+      <span id="dur" class="muted" style="min-width:56px;text-align:center">--:--</span>
+    </div>
+    <div class="row">
+      <button id="b60">⏪ 60 秒</button>
+      <button id="b10">⏪ 10 秒</button>
+      <button id="f10">10 秒 ⏩</button>
+      <button id="f60">60 秒 ⏩</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>网络</h2>
+    <div class="muted">电视通过 <code id="pcurl">…</code> 拉取内容。电脑有多个网卡时，选电视能访问到的那个：</div>
+    <div class="row">
+      <input id="hostip" list="ips" placeholder="自动">
+      <datalist id="ips"></datalist>
+      <button id="savehost">保存</button>
+      <button id="fw">放行防火墙</button>
+    </div>
+    <div class="muted" style="margin-top:8px">「放行防火墙」要以管理员身份运行本程序才有效；也可以手动放行 TCP <span id="mport">8000</span>。</div>
+  </div>
+</div>
+
+<script>
+var $ = function (id) { return document.getElementById(id); };
+var loaded = false;
+
+function say(text, bad) { var m = $('msg'); m.textContent = text || ''; m.className = bad ? 'err' : 'ok'; }
+
+function api(path, body) {
+  return fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-EasyCast': '1' },
+    body: JSON.stringify(body || {})
+  }).then(function (r) {
+    return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || r.statusText); return j; });
+  });
+}
+function run(label, p) { say(label + '…'); return p.then(function (j) { say(label + '：成功'); return j; }).catch(function (e) { say(e.message, true); }); }
+
+var STATES = { PLAYING: '播放中', PAUSED_PLAYBACK: '已暂停', TRANSITIONING: '加载中', STOPPED: '空闲' };
+
+function refresh() {
+  fetch('/api/status').then(function (r) { return r.json(); }).then(function (s) {
+    if (!loaded) {
+      $('tvaddr').value = s.config.tv_addr || '';
+      $('tvpin').value = s.config.tv_pin || '';
+      $('hostip').value = s.config.host_ip || '';
+      loaded = true;
+    }
+    var dl = $('ips'); dl.textContent = '';
+    (s.pc_ips || []).forEach(function (ip) { var o = document.createElement('option'); o.value = ip; dl.appendChild(o); });
+    $('hostip').placeholder = '自动（' + s.pc_ip + '）';
+    $('pcurl').textContent = 'http://' + s.pc_ip + ':' + s.media_port;
+    $('mport').textContent = s.media_port;
+    $('rtmp').textContent = s.rtmp_url;
+
+    var d = $('tvdot'), info = $('tvinfo');
+    if (!s.tv.configured) { d.className = 'dot'; info.textContent = '未设置'; }
+    else if (s.tv.ok) { d.className = 'dot ok'; info.textContent = '已连接：' + s.tv.device + '　状态：' + (STATES[s.tv.state] || s.tv.state); }
+    else { d.className = 'dot bad'; info.textContent = s.tv.error; }
+
+    showProgress(s.tv);
+
+    var live = (s.live || {}).tv || {};
+    $('livedot').className = 'dot ' + (live.publishing ? 'ok' : 'wait');
+    $('liveinfo').textContent = live.publishing ? '已收到 OBS 推流，当前观看者 ' + live.viewers + ' 个' : '等待 OBS 推流…';
+  }).catch(function () {});
+}
+
+$('save').onclick = function () {
+  run('保存', api('/api/config', { tv_addr: $('tvaddr').value, tv_pin: $('tvpin').value, host_ip: $('hostip').value })).then(refresh);
+};
+$('savehost').onclick = $('save').onclick;
+// Show the address a registered file can be played from (also used by VLC, a browser, a phone).
+function showLink(url) {
+  $('fileurl').textContent = url;
+  $('linkbox').style.display = url ? 'block' : 'none';
+}
+function makeLink() {
+  var p = $('path').value.trim();
+  if (!p) { showLink(''); return Promise.resolve(); }
+  return api('/api/file-link', { path: p }).then(function (j) { showLink(j.url); say(''); })
+    .catch(function (e) { showLink(''); say(e.message, true); });
+}
+$('pick').onclick = function () {
+  api('/api/pick').then(function (j) { if (j.path) { $('path').value = j.path; return makeLink(); } })
+    .catch(function (e) { say(e.message, true); });
+};
+$('path').onchange = makeLink;
+$('copy').onclick = function () {
+  var url = $('fileurl').textContent;
+  var done = function () { say('地址已复制'); };
+  if (navigator.clipboard) { navigator.clipboard.writeText(url).then(done, function () { say('复制失败，请手动选中地址复制', true); }); }
+  else { say('请手动选中地址复制', true); }
+};
+$('open').onclick = function () { window.open($('fileurl').textContent, '_blank'); };
+$('playfile').onclick = function () {
+  run('推送文件', api('/api/play-file', { path: $('path').value }).then(function (j) { showLink(j.url); return j; })).then(refresh);
+};
+$('playlive').onclick = function () { run('推送 OBS 画面', api('/api/play-live')).then(refresh); };
+$('pause').onclick = function () { run('暂停', api('/api/tv/pause')).then(refresh); };
+$('resume').onclick = function () { run('继续', api('/api/tv/resume')).then(refresh); };
+$('stop').onclick = function () { run('停止', api('/api/tv/stop')).then(refresh); };
+$('fw').onclick = function () { run('放行防火墙', api('/api/firewall')); };
+
+// Seeking: buttons jump by an offset, the slider jumps to an absolute position when released.
+function jump(delta) { run(delta < 0 ? '后退' : '快进', api('/api/seek', { delta: delta })).then(refresh); }
+$('b60').onclick = function () { jump(-60000); };
+$('b10').onclick = function () { jump(-10000); };
+$('f10').onclick = function () { jump(10000); };
+$('f60').onclick = function () { jump(60000); };
+
+var dragging = false, duration = 0;
+function fmt(ms) {
+  var t = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s = t % 60;
+  var two = function (n) { return (n < 10 ? '0' : '') + n; };
+  return h > 0 ? h + ':' + two(m) + ':' + two(s) : two(m) + ':' + two(s);
+}
+$('bar').addEventListener('input', function () {
+  dragging = true;
+  $('pos').textContent = fmt($('bar').value / 1000 * duration);
+});
+$('bar').addEventListener('change', function () {
+  dragging = false;
+  run('跳转', api('/api/seek', { ms: Math.round($('bar').value / 1000 * duration) })).then(refresh);
+});
+function showProgress(tv) {
+  duration = tv.dur || 0;
+  var bar = $('bar');
+  bar.disabled = !(tv.ok && tv.seekable && duration > 0);
+  if (dragging) return;
+  if (tv.ok && duration > 0) {
+    bar.value = Math.round(tv.pos / duration * 1000);
+    $('pos').textContent = fmt(tv.pos);
+    $('dur').textContent = fmt(duration);
+  } else {
+    bar.value = 0;
+    $('pos').textContent = (tv.ok && tv.state && tv.state !== 'STOPPED') ? '直播' : '--:--';
+    $('dur').textContent = '--:--';
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -25,10 +25,13 @@ import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.media3.common.C
 import androidx.media3.common.Player
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -85,11 +88,17 @@ class MainActivity : Activity(), DlnaService.Ui {
         root.addView(surface, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
         root.addView(status, FrameLayout.LayoutParams(-1, -1))
         root.addView(buildIdleLayout(), FrameLayout.LayoutParams(-1, -1))
+        root.addView(buildSeekPanel(), FrameLayout.LayoutParams(dp(720), -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin = dp(48)
+        })
         root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> fitSurface() }
         setContentView(root)
 
         // Make sure the background service is up (it normally already is).
         startForegroundService(Intent(this, DlnaService::class.java))
+        // Opening the app from the launcher counts as starting it: pick up a day change now.
+        // (If the service is not up yet, its own start does the check.)
+        DlnaService.instance?.checkPin()
     }
 
     private fun buildIdleLayout(): LinearLayout {
@@ -152,9 +161,14 @@ class MainActivity : Activity(), DlnaService.Ui {
             topMargin = dp(12)
             bottomMargin = dp(8)
         })
-        idleLayout.addView(buildButtonBar(), LinearLayout.LayoutParams(-2, -2).apply {
-            gravity = Gravity.CENTER_HORIZONTAL
-        })
+        // Centered when it fits; scrolls sideways (following focus) if the TV is too narrow for all buttons.
+        val scroller = HorizontalScrollView(this).apply {
+            isFillViewport = true
+            isHorizontalScrollBarEnabled = false
+            clipChildren = false
+            addView(buildButtonBar(), FrameLayout.LayoutParams(-2, -2))
+        }
+        idleLayout.addView(scroller, LinearLayout.LayoutParams(-1, -2))
         return idleLayout
     }
 
@@ -222,7 +236,7 @@ class MainActivity : Activity(), DlnaService.Ui {
         val ip = if (svc!!.localIp == "0.0.0.0") "未获取" else svc.localIp
         infoView.text = "设备名：${svc.deviceName}        网络：${svc.networkLabel()}        IP：$ip" +
             if (svc.localIp == "0.0.0.0") "" else
-                "\n电脑浏览器推送：http://${svc.localIp}:${DlnaRenderer.HTTP_PORT}        口令：${svc.webPin}"
+                "\n电脑浏览器推送：http://${svc.localIp}:${DlnaRenderer.HTTP_PORT}        口令：${svc.webPin}（每天自动更换）"
         noticeView.text = notice
         noticeView.visibility = if (notice != null) View.VISIBLE else View.GONE
 
@@ -258,6 +272,8 @@ class MainActivity : Activity(), DlnaService.Ui {
                     toast("无法打开系统设置")
                 }
             },
+            "更换口令" to { attached?.let { confirmNewPin(it) } },
+            // Keep this one last: its click handler finds itself with buttons.last().
             "隐藏日志" to {
                 logEnabled = !logEnabled
                 buttons.last().text = if (logEnabled) "隐藏日志" else "显示日志"
@@ -267,19 +283,32 @@ class MainActivity : Activity(), DlnaService.Ui {
         for ((label, action) in actions) {
             val b = Button(this).apply {
                 text = label
-                textSize = 18f
+                textSize = 17f
                 setTextColor(Color.WHITE)
                 isAllCaps = false
                 isFocusable = true
-                setPadding(dp(20), dp(12), dp(20), dp(12))
+                setPadding(dp(16), dp(12), dp(16), dp(12))
                 setOnClickListener { action() }
                 applyButtonStyle(this, false)
                 setOnFocusChangeListener { v, focused -> applyButtonStyle(v as Button, focused) }
             }
             buttons += b
-            buttonBar.addView(b, LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(8), 0, dp(8), 0) })
+            buttonBar.addView(b, LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(6), 0, dp(6), 0) })
         }
         return buttonBar
+    }
+
+    /** Ask first: every browser tab and the PC program that saved the old PIN stops working. */
+    private fun confirmNewPin(svc: DlnaService) {
+        AlertDialog.Builder(this)
+            .setTitle("更换口令")
+            .setMessage("换成新的随机 4 位口令。电脑端程序和浏览器里保存的旧口令会失效，需要重新填写。")
+            .setPositiveButton("更换") { _, _ ->
+                svc.regeneratePin()
+                toast("新口令：${svc.webPin}")
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     private fun applyButtonStyle(b: Button, focused: Boolean) {
@@ -555,19 +584,108 @@ class MainActivity : Activity(), DlnaService.Ui {
         }
     }
 
+    // ---- playback progress overlay (shown briefly on seek / pause) ----
+
+    private lateinit var seekPanel: LinearLayout
+    private lateinit var seekText: TextView
+    private lateinit var seekProgress: ProgressBar
+    private var seekNote: String? = null
+    private val hideSeek = Runnable { seekPanel.visibility = View.GONE }
+    private val tickSeek = object : Runnable {
+        override fun run() {
+            if (seekPanel.visibility != View.VISIBLE) return
+            updateSeekInfo()
+            main.postDelayed(this, 500)
+        }
+    }
+
+    private fun buildSeekPanel(): LinearLayout {
+        seekText = TextView(this).apply {
+            textSize = 20f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+        }
+        seekProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
+        seekPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(14), dp(24), dp(16))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(12).toFloat()
+                setColor(Color.parseColor("#B3000000"))
+            }
+            visibility = View.GONE
+            addView(seekText, LinearLayout.LayoutParams(-1, -2))
+            addView(seekProgress, LinearLayout.LayoutParams(-1, dp(8)).apply { topMargin = dp(10) })
+        }
+        return seekPanel
+    }
+
+    private fun fmtTime(ms: Long): String {
+        val t = (ms.coerceAtLeast(0) / 1000)
+        return if (t >= 3600) "%d:%02d:%02d".format(t / 3600, t % 3600 / 60, t % 60)
+        else "%02d:%02d".format(t / 60, t % 60)
+    }
+
+    private fun updateSeekInfo() {
+        val p = attached?.player ?: return
+        val dur = if (p.duration == C.TIME_UNSET) 0L else p.duration
+        val pos = p.currentPosition.coerceAtLeast(0)
+        val icon = if (p.playWhenReady) "▶" else "⏸"
+        val time = if (dur > 0) "$icon  ${fmtTime(pos)} / ${fmtTime(dur)}" else "$icon  直播"
+        seekText.text = seekNote?.let { "$it\n$time" } ?: time
+        seekProgress.progress = if (dur > 0) (pos * 1000 / dur).toInt() else 0
+        seekProgress.visibility = if (dur > 0) View.VISIBLE else View.GONE
+    }
+
+    /** Show the progress panel for a few seconds, with an optional one-line note ("快进 10 秒"). */
+    private fun showSeekInfo(note: String? = null) {
+        seekNote = note
+        seekPanel.visibility = View.VISIBLE
+        updateSeekInfo()
+        main.removeCallbacks(hideSeek)
+        main.removeCallbacks(tickSeek)
+        main.postDelayed(tickSeek, 500)
+        main.postDelayed(hideSeek, 3500)
+    }
+
     // ---- keys ----
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         val svc = attached
+
+        // While something plays: left/right = back/forward 10 s (held: faster), the media keys = 30 s.
+        if (svc != null && svc.player.playbackState != Player.STATE_IDLE) {
+            val step = when (keyCode) {
+                KeyEvent.KEYCODE_DPAD_RIGHT -> 10_000L
+                KeyEvent.KEYCODE_DPAD_LEFT -> -10_000L
+                KeyEvent.KEYCODE_MEDIA_FAST_FORWARD, KeyEvent.KEYCODE_MEDIA_STEP_FORWARD -> 30_000L
+                KeyEvent.KEYCODE_MEDIA_REWIND, KeyEvent.KEYCODE_MEDIA_STEP_BACKWARD -> -30_000L
+                else -> 0L
+            }
+            if (step != 0L) {
+                // A held key repeats very fast; act on every 4th repeat and make those jumps bigger.
+                if (event.repeatCount > 0 && event.repeatCount % 4 != 0) return true
+                val s = if (event.repeatCount > 0) step * 3 else step
+                val ok = svc.seekBy(s)
+                val secs = kotlin.math.abs(s) / 1000
+                showSeekInfo(
+                    if (ok) (if (s > 0) "快进 $secs 秒" else "后退 $secs 秒")
+                    else "直播流（或不支持拖动的视频）无法快进/后退"
+                )
+                return true
+            }
+        }
+
         // While idle the focused button handles OK itself; this only runs for keys no view consumed.
         when (keyCode) {
             KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER,
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_SPACE -> {
                 svc?.togglePlayPause()
+                if (svc != null && svc.player.playbackState != Player.STATE_IDLE) showSeekInfo()
                 return true
             }
-            KeyEvent.KEYCODE_MEDIA_PLAY -> { svc?.resumePlayback(); return true }
-            KeyEvent.KEYCODE_MEDIA_PAUSE -> { svc?.pausePlayback(); return true }
+            KeyEvent.KEYCODE_MEDIA_PLAY -> { svc?.resumePlayback(); showSeekInfo(); return true }
+            KeyEvent.KEYCODE_MEDIA_PAUSE -> { svc?.pausePlayback(); showSeekInfo(); return true }
         }
         if (keyCode == KeyEvent.KEYCODE_BACK && svc != null &&
             svc.player.playbackState != Player.STATE_IDLE

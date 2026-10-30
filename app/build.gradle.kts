@@ -58,4 +58,7 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer:1.1.1")
     implementation("androidx.media3:media3-exoplayer-hls:1.1.1")
     implementation("androidx.media3:media3-datasource:1.1.1")
+    testImplementation("junit:junit:4.13.2")
+    // rtmp:// live streams (DefaultDataSource picks this up for the rtmp scheme)
+    implementation("androidx.media3:media3-datasource-rtmp:1.1.1")
 }

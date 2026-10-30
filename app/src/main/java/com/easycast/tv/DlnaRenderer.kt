@@ -28,6 +28,8 @@ interface RendererListener {
     fun transportState(): String
     fun positionMs(): Long
     fun durationMs(): Long
+    /** False for live streams and for servers without Range support: there is nothing to seek in. */
+    fun seekable(): Boolean
 }
 
 /**
@@ -301,8 +303,9 @@ class DlnaRenderer(
             val parts = reqLine.split(" ")
             if (parts.size < 2) return
             val method = parts[0]
-            val path = parts[1].substringBefore('?')
-            val query = parts[1].substringAfter('?', "")
+            val target = originForm(parts[1])
+            val path = target.substringBefore('?')
+            val query = target.substringAfter('?', "")
             // Only the device description from other devices is interesting; the TV's own system
             // keeps re-reading it (and the service files) every second.
             val from = it.inetAddress.hostAddress
@@ -395,20 +398,35 @@ class DlnaRenderer(
                     pinFails = 0
                     pinLockedUntil = System.currentTimeMillis() + 60_000
                 }
-                return "403 Forbidden" to error("口令不对")
+                return "403 Forbidden" to error("口令不对（口令每天自动更换，请看电视主界面上的新口令）")
             }
             pinFails = 0
         }
         return when (path) {
             "/api/state" ->
                 "200 OK" to "{\"state\":${json(listener.transportState())},\"uri\":${json(currentUri)}," +
-                    "\"device\":${json(friendlyName)},\"ip\":${json(localIp)}}"
+                    "\"device\":${json(friendlyName)},\"ip\":${json(localIp)}," +
+                    "\"pos\":${listener.positionMs()},\"dur\":${listener.durationMs()},\"seekable\":${listener.seekable()}}"
+            "/api/seek" -> {
+                if (!listener.seekable()) {
+                    "409 Conflict" to error("这个视频不能快进/后退（直播流，或文件服务器不支持 Range）")
+                } else {
+                    val dur = listener.durationMs()
+                    val raw = params["ms"]?.toLongOrNull()
+                        ?: (listener.positionMs() + (params["delta"]?.toLongOrNull() ?: 0L))
+                    // Stay a second short of the end so a seek to "the end" does not just stop playback.
+                    val target = raw.coerceIn(0L, if (dur > 0) maxOf(dur - 1000, 0L) else Long.MAX_VALUE)
+                    AppLog.i("网页操作：跳到 ${target / 1000} 秒")
+                    listener.onSeek(target)
+                    "200 OK" to "{\"ok\":true,\"pos\":$target}"
+                }
+            }
             "/api/recent" ->
                 "200 OK" to listener.recentUrls().joinToString(",", "[", "]") { (t, u) -> "{\"time\":$t,\"url\":${json(u)}}" }
             "/api/play" -> {
                 val url = params["url"]?.trim().orEmpty()
-                if (!url.startsWith("http://") && !url.startsWith("https://")) {
-                    "400 Bad Request" to error("地址要以 http:// 或 https:// 开头")
+                if (listOf("http://", "https://", "rtmp://").none { url.startsWith(it, ignoreCase = true) }) {
+                    "400 Bad Request" to error("地址要以 http://、https:// 或 rtmp:// 开头")
                 } else {
                     AppLog.i("网页推送：$url  来自 $from")
                     currentUri = url

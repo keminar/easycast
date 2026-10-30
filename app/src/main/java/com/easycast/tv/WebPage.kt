@@ -28,6 +28,9 @@ object WebPage {
   button.primary { background: #1e88e5; }
   button.primary:hover { background: #3b99ee; }
   button.danger { background: #8a2c2c; }
+  .seek { display: flex; align-items: center; gap: 10px; margin-top: 16px; }
+  .seek input { flex: 1; padding: 0; accent-color: #1e88e5; }
+  .seek span { color: #bbb; font-size: 13px; min-width: 52px; text-align: center; font-variant-numeric: tabular-nums; }
   #msg { min-height: 24px; margin-top: 12px; font-size: 14px; }
   .ok { color: #7bd88f; } .bad { color: #ff7b7b; }
   .item { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; margin-bottom: 8px; background: #1c1c1c; border-radius: 8px; }
@@ -44,7 +47,7 @@ object WebPage {
   <label for="pin">口令（电视主界面上显示）</label>
   <input id="pin" inputmode="numeric" maxlength="8" placeholder="4 位口令" autocomplete="off">
 
-  <label for="url">视频地址（http / https：直播流 FLV、m3u8，或 MP4 等文件）</label>
+  <label for="url">视频地址（http / https / rtmp：直播流 FLV、m3u8、RTMP，或 MP4 等文件）</label>
   <textarea id="url" rows="3" placeholder="例如 http://192.168.1.4:8000/电影.mp4"></textarea>
 
   <div class="row">
@@ -52,6 +55,17 @@ object WebPage {
     <button id="pause">暂停</button>
     <button id="resume">继续</button>
     <button id="stop" class="danger">停止</button>
+  </div>
+  <div class="seek">
+    <span id="pos">--:--</span>
+    <input id="bar" type="range" min="0" max="1000" value="0" disabled>
+    <span id="dur">--:--</span>
+  </div>
+  <div class="row">
+    <button id="b60">⏪ 60 秒</button>
+    <button id="b10">⏪ 10 秒</button>
+    <button id="f10">10 秒 ⏩</button>
+    <button id="f60">60 秒 ⏩</button>
   </div>
   <div id="msg"></div>
 
@@ -99,6 +113,43 @@ el('pause').onclick = function () { act('/api/pause', {}, '已暂停'); };
 el('resume').onclick = function () { act('/api/resume', {}, '继续播放'); };
 el('stop').onclick = function () { act('/api/stop', {}, '已停止'); };
 
+// Seeking: buttons jump by an offset, the slider jumps to an absolute position when released.
+function jump(delta) { act('/api/seek', { delta: delta }, delta < 0 ? '已后退' : '已快进'); }
+el('b60').onclick = function () { jump(-60000); };
+el('b10').onclick = function () { jump(-10000); };
+el('f10').onclick = function () { jump(10000); };
+el('f60').onclick = function () { jump(60000); };
+
+var dragging = false, duration = 0;
+function fmt(ms) {
+  var t = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s = t % 60;
+  var two = function (n) { return (n < 10 ? '0' : '') + n; };
+  return h > 0 ? h + ':' + two(m) + ':' + two(s) : two(m) + ':' + two(s);
+}
+el('bar').addEventListener('input', function () {
+  dragging = true;
+  el('pos').textContent = fmt(el('bar').value / 1000 * duration);
+});
+el('bar').addEventListener('change', function () {
+  dragging = false;
+  act('/api/seek', { ms: Math.round(el('bar').value / 1000 * duration) }, '已跳转');
+});
+function showProgress(s) {
+  duration = s.dur || 0;
+  var bar = el('bar');
+  bar.disabled = !(s.seekable && duration > 0);
+  if (dragging) return;
+  if (duration > 0) {
+    bar.value = Math.round(s.pos / duration * 1000);
+    el('pos').textContent = fmt(s.pos);
+    el('dur').textContent = fmt(duration);
+  } else {
+    bar.value = 0;
+    el('pos').textContent = s.state === 'STOPPED' ? '--:--' : '直播';
+    el('dur').textContent = '--:--';
+  }
+}
+
 var STATES = { PLAYING: '播放中', PAUSED_PLAYBACK: '已暂停', TRANSITIONING: '加载中', STOPPED: '空闲' };
 
 function refresh() {
@@ -106,6 +157,7 @@ function refresh() {
     if (!r.ok) { el('info').textContent = r.data.error || '口令不对'; return; }
     var s = r.data;
     el('info').textContent = '设备：' + s.device + '　状态：' + (STATES[s.state] || s.state);
+    showProgress(s);
   }).catch(function () { el('info').textContent = '连不上电视'; });
 
   call('/api/recent').then(function (r) {
@@ -127,7 +179,7 @@ function refresh() {
 }
 
 refresh();
-setInterval(refresh, 3000);
+setInterval(refresh, 1500);
 </script>
 </body>
 </html>
