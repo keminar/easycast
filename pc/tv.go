@@ -43,7 +43,7 @@ func (c tvClient) base() string {
 // call POSTs to the TV and decodes its JSON reply. A non-2xx reply becomes an error carrying the TV's message.
 func (c tvClient) call(path string, form url.Values) (map[string]any, error) {
 	if strings.TrimSpace(c.addr) == "" {
-		return nil, errors.New("还没有填电视地址")
+		return nil, errors.New("还没有连接电视：请填好电视地址和口令，点「保存并连接」")
 	}
 	if form == nil {
 		form = url.Values{}
@@ -89,6 +89,12 @@ func (c tvClient) seek(ms int64, absolute bool) error {
 
 func (c tvClient) command(name string) error {
 	_, err := c.call("/api/"+name, nil)
+	return err
+}
+
+// rename changes the name the TV advertises, which is what phone cast lists show.
+func (c tvClient) rename(name string) error {
+	_, err := c.call("/api/name", url.Values{"name": {name}})
 	return err
 }
 

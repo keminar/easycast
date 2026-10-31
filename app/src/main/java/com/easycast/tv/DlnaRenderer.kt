@@ -22,6 +22,8 @@ interface RendererListener {
     fun onPause()
     fun onStop()
     fun onSeek(ms: Long)
+    /** Renames the device (the web page / the PC app); the name is saved and re-announced. */
+    fun onRename(name: String)
     /** Recent cast URLs (epoch millis, url), newest first; shown on the web page. */
     fun recentUrls(): List<Pair<Long, String>>
     /** One of PLAYING, PAUSED_PLAYBACK, STOPPED, TRANSITIONING. */
@@ -45,6 +47,8 @@ class DlnaRenderer(
 ) {
     companion object {
         const val HTTP_PORT = 8200
+        /** Longest device name accepted from the web page / the PC app. */
+        const val MAX_NAME_LENGTH = 30
         private const val SSDP_ADDR = "239.255.255.250"
         private const val SSDP_PORT = 1900
         private const val AV = "urn:schemas-upnp-org:service:AVTransport:1"
@@ -427,6 +431,20 @@ class DlnaRenderer(
             "/api/pause" -> { AppLog.i("网页操作：暂停"); listener.onPause(); "200 OK" to "{\"ok\":true}" }
             "/api/resume" -> { AppLog.i("网页操作：继续"); listener.onPlay(); "200 OK" to "{\"ok\":true}" }
             "/api/stop" -> { AppLog.i("网页操作：停止"); listener.onStop(); "200 OK" to "{\"ok\":true}" }
+            "/api/name" -> {
+                val name = params["name"]?.trim().orEmpty()
+                when {
+                    name.isEmpty() ->
+                        "400 Bad Request" to error("名字不能为空")
+                    name.length > MAX_NAME_LENGTH ->
+                        "400 Bad Request" to error("名字太长（最多 $MAX_NAME_LENGTH 个字）")
+                    else -> {
+                        AppLog.i("网页改名：$name  来自 $from")
+                        listener.onRename(name)
+                        "200 OK" to "{\"ok\":true,\"device\":${json(name)}}"
+                    }
+                }
+            }
             else -> "404 Not Found" to error("没有这个接口")
         }
     }

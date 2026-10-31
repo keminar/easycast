@@ -301,6 +301,7 @@ type fakeTV struct {
 	played []string
 	cmds   []string
 	seeks  []string // "delta|ms" as received
+	names  []string // names sent to /api/name
 }
 
 func newFakeTV(t *testing.T, pin string) *fakeTV {
@@ -316,6 +317,14 @@ func newFakeTV(t *testing.T, pin string) *fakeTV {
 		switch r.URL.Path {
 		case "/api/play":
 			f.played = append(f.played, r.PostForm.Get("url"))
+		case "/api/name":
+			name := r.PostForm.Get("name")
+			if strings.TrimSpace(name) == "" {
+				w.WriteHeader(400)
+				_, _ = w.Write([]byte(`{"error":"名字不能为空"}`))
+				return
+			}
+			f.names = append(f.names, name)
 		case "/api/state":
 			_, _ = w.Write([]byte(`{"state":"PLAYING","uri":"x","device":"EasyCast太阳","ip":"1.2.3.4","pos":5000,"dur":600000,"seekable":true}`))
 			return
@@ -524,6 +533,133 @@ func TestUISeekForwardsToTVAndStatusCarriesProgress(t *testing.T) {
 	}
 	if st.TV.Pos != 5000 || st.TV.Dur != 600000 || !st.TV.Seekable {
 		t.Fatalf("status tv progress = %+v", st.TV)
+	}
+}
+
+func TestUIDisconnectKeepsAddressAndBlocksPush(t *testing.T) {
+	tv := newFakeTV(t, "1234")
+	addr := strings.TrimPrefix(tv.URL, "http://")
+	a := testApp(t, addr, "1234")
+	ui := httptest.NewServer(a.uiHandler())
+	defer ui.Close()
+
+	post := func(path, body string) (*http.Response, map[string]any) {
+		req, _ := http.NewRequest("POST", ui.URL+path, strings.NewReader(body))
+		req.Header.Set("X-EasyCast", "1")
+		req.Host = "127.0.0.1:9000"
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp, out
+	}
+	linkState := func() (configured, linked, ok bool) {
+		req := httptest.NewRequest("GET", "/api/status", nil)
+		req.Host = "127.0.0.1:9000"
+		rec := httptest.NewRecorder()
+		a.uiHandler().ServeHTTP(rec, req)
+		var st struct {
+			TV struct {
+				Configured bool `json:"configured"`
+				Linked     bool `json:"linked"`
+				OK         bool `json:"ok"`
+			} `json:"tv"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
+			t.Fatal(err)
+		}
+		return st.TV.Configured, st.TV.Linked, st.TV.OK
+	}
+
+	if c, l, ok := linkState(); !c || !l || !ok {
+		t.Fatalf("fresh app with a reachable TV: configured=%v linked=%v ok=%v", c, l, ok)
+	}
+
+	// 断开连接: the link goes down and the page is told so, but the address stays for next time.
+	if resp, _ := post("/api/disconnect", "{}"); resp.StatusCode != 200 {
+		t.Fatalf("disconnect: %d", resp.StatusCode)
+	}
+	if c, l, ok := linkState(); !c || l || ok {
+		t.Fatalf("after disconnect: configured=%v linked=%v ok=%v", c, l, ok)
+	}
+	if got := strings.TrimSpace(a.cfg.get().TVAddr); got != addr {
+		t.Errorf("address after disconnect = %q, want %q", got, addr)
+	}
+	if got := strings.TrimSpace(a.cfg.get().TVPin); got != "1234" {
+		t.Errorf("pin after disconnect = %q, want 1234", got)
+	}
+
+	// Pushing while disconnected says so, and does not reach the TV.
+	dir := t.TempDir()
+	p := filepath.Join(dir, "x.mp4")
+	_ = os.WriteFile(p, []byte("x"), 0o644)
+	resp, out := post("/api/play-file", `{"path":"`+strings.ReplaceAll(p, `\`, `\\`)+`"}`)
+	if resp.StatusCode == 200 {
+		t.Fatal("push accepted while disconnected")
+	}
+	if msg, _ := out["error"].(string); !strings.Contains(msg, "还没有连接电视") {
+		t.Errorf("push error while disconnected = %q", msg)
+	}
+	if len(tv.played) != 0 {
+		t.Errorf("disconnected push reached the TV: %v", tv.played)
+	}
+
+	// 保存并连接: one more save links again, with no re-typing.
+	if resp, _ := post("/api/config", `{"tv_addr":"`+addr+`","tv_pin":"1234","host_ip":"192.168.1.4","link":true}`); resp.StatusCode != 200 {
+		t.Fatalf("reconnect: %d", resp.StatusCode)
+	}
+	if c, l, ok := linkState(); !c || !l || !ok {
+		t.Fatalf("after reconnect: configured=%v linked=%v ok=%v", c, l, ok)
+	}
+}
+
+func TestUIRenameForwardsTrimmedNameToTV(t *testing.T) {
+	tv := newFakeTV(t, "1234")
+	a := testApp(t, strings.TrimPrefix(tv.URL, "http://"), "1234")
+	ui := httptest.NewServer(a.uiHandler())
+	defer ui.Close()
+
+	post := func(body string) (int, map[string]any) {
+		req, _ := http.NewRequest("POST", ui.URL+"/api/rename", strings.NewReader(body))
+		req.Header.Set("X-EasyCast", "1")
+		req.Host = "127.0.0.1:9000"
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out
+	}
+
+	code, out := post(`{"name":"  客厅大屏  "}`)
+	if code != 200 || out["device"] != "客厅大屏" {
+		t.Fatalf("rename: %d %v", code, out)
+	}
+	if len(tv.names) != 1 || tv.names[0] != "客厅大屏" {
+		t.Fatalf("TV received names %v", tv.names)
+	}
+
+	// An empty name is refused here, without bothering the TV.
+	if code, _ := post(`{"name":"   "}`); code != 400 {
+		t.Errorf("empty name: status %d, want 400", code)
+	}
+	if len(tv.names) != 1 {
+		t.Errorf("empty name reached the TV: %v", tv.names)
+	}
+
+	// Disconnected: renaming says why instead of silently failing.
+	_ = a.cfg.update(func(c *config) { c.Disconnected = true })
+	code, out = post(`{"name":"x"}`)
+	if code == 200 {
+		t.Fatal("rename accepted while disconnected")
+	}
+	if msg, _ := out["error"].(string); !strings.Contains(msg, "还没有连接电视") {
+		t.Errorf("rename error while disconnected = %q", msg)
 	}
 }
 

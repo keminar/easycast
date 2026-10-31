@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -37,6 +38,7 @@ class DlnaService : Service(), RendererListener {
     interface Ui {
         fun onStatus(text: String?)
         fun onAspect(aspect: Float)
+        fun onPlaybackActive(active: Boolean)
     }
 
     companion object {
@@ -47,7 +49,7 @@ class DlnaService : Service(), RendererListener {
         const val IDLE_STATUS = "\u0000idle"
         private const val PREFS = "easycast"
         private const val KEY_NAME = "device_name"
-        const val MAX_NAME_LENGTH = 30
+        const val MAX_NAME_LENGTH = DlnaRenderer.MAX_NAME_LENGTH
         private const val KEY_PIN = "web_pin"
         private const val KEY_CASTS = "recent_casts"
         private const val MAX_CASTS = 5
@@ -85,6 +87,10 @@ class DlnaService : Service(), RendererListener {
         private set
     private lateinit var renderer: DlnaRenderer
     private var multicastLock: WifiManager.MulticastLock? = null
+    // Partial wake lock: keeps the CPU (and therefore SSDP discovery) alive while the screen is off,
+    // WITHOUT forcing the display on — so the TV can sleep and its power key still works.
+    private var discoveryWakeLock: PowerManager.WakeLock? = null
+    private var lastActive = false
     private var currentUri: String? = null
     private var pausedAt = 0L
 
@@ -150,6 +156,14 @@ class DlnaService : Service(), RendererListener {
         multicastLock = wifi.createMulticastLock("easycast").apply {
             setReferenceCounted(false); acquire()
         }
+        // Stay reachable for casting even after the screen turns off. Partial only: does not keep
+        // the display on, so the TV still sleeps normally and the power key keeps working.
+        discoveryWakeLock = (getSystemService(POWER_SERVICE) as PowerManager).newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK, "easycast:discovery"
+        ).apply {
+            setReferenceCounted(false)
+            acquire()
+        }
 
         deviceName = getSharedPreferences(PREFS, MODE_PRIVATE)
             .getString(KEY_NAME, null)?.takeIf { it.isNotBlank() } ?: DEFAULT_NAME
@@ -183,6 +197,7 @@ class DlnaService : Service(), RendererListener {
         renderer.stop()
         player.release()
         multicastLock?.release()
+        discoveryWakeLock?.release()
         super.onDestroy()
     }
 
@@ -279,8 +294,13 @@ class DlnaService : Service(), RendererListener {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_NAME, name).apply()
         renderer.friendlyName = name
         // Network I/O must stay off the main thread; byebye + alive makes controllers refresh the name.
+        // The short pause lets the web request that asked for the rename finish writing its reply
+        // before restart() closes the server socket.
         AppLog.i("设备名已改为：$name")
-        Thread { renderer.restart() }.start()
+        Thread {
+            try { Thread.sleep(400) } catch (_: InterruptedException) {}
+            renderer.restart()
+        }.start()
         if (player.playbackState == Player.STATE_IDLE) setStatus(idleText())
     }
 
@@ -290,12 +310,30 @@ class DlnaService : Service(), RendererListener {
     }
 
     private fun bringUiToFront() {
+        wakeScreenIfAsleep()
         startActivity(
             Intent(this, MainActivity::class.java).addFlags(
                 Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
             )
         )
     }
+
+    /** A cast can arrive while the TV is asleep: briefly wake the panel so the video is seen. */
+    @Suppress("DEPRECATION")
+    private fun wakeScreenIfAsleep() {
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        if (!pm.isInteractive) {
+            pm.newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                "easycast:cast-wake"
+            ).apply { setReferenceCounted(false) }.acquire(10_000)
+        }
+    }
+
+    /** True while a video is loaded and meant to be playing, i.e. the screen should stay on. */
+    fun isPlaybackActive(): Boolean =
+        player.playWhenReady &&
+            (player.playbackState == Player.STATE_BUFFERING || player.playbackState == Player.STATE_READY)
 
     fun stopPlayback() {
         AppLog.i("停止播放")
@@ -345,6 +383,12 @@ class DlnaService : Service(), RendererListener {
             cPos = player.currentPosition.coerceAtLeast(0)
             cDur = if (player.duration == C.TIME_UNSET) 0 else player.duration
             cSeekable = player.playbackState != Player.STATE_IDLE && player.isCurrentMediaItemSeekable
+            // Tell the activity when to hold/release FLAG_KEEP_SCREEN_ON (only while really playing).
+            val active = isPlaybackActive()
+            if (active != lastActive) {
+                lastActive = active
+                ui?.onPlaybackActive(active)
+            }
             main.postDelayed(this, 500)
         }
     }
@@ -392,6 +436,11 @@ class DlnaService : Service(), RendererListener {
 
     override fun onSeek(ms: Long) {
         main.post { if (player.isCurrentMediaItemSeekable) player.seekTo(ms) }
+    }
+
+    /** Renaming touches prefs and re-announces over the network, so it hops to the main thread. */
+    override fun onRename(name: String) {
+        main.post { renameDevice(name) }
     }
 
     /**

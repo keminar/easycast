@@ -18,8 +18,13 @@ type app struct {
 	files *fileRegistry
 }
 
+// tv returns the client for the saved TV. After "断开连接" the address is empty on purpose, so every
+// call fails with a clear "还没有连接电视" message instead of silently talking to the TV.
 func (a *app) tv() tvClient {
 	c := a.cfg.get()
+	if c.Disconnected {
+		return tvClient{}
+	}
 	return tvClient{addr: c.TVAddr, pin: c.TVPin}
 }
 
@@ -47,10 +52,12 @@ func (a *app) uiHandler() http.Handler {
 	})
 	mux.HandleFunc("/api/status", a.status)
 	mux.HandleFunc("/api/config", a.setConfig)
+	mux.HandleFunc("/api/disconnect", a.disconnect)
 	mux.HandleFunc("/api/pick", a.pick)
 	mux.HandleFunc("/api/file-link", a.fileLink)
 	mux.HandleFunc("/api/play-file", a.playFile)
 	mux.HandleFunc("/api/play-live", a.playLive)
+	mux.HandleFunc("/api/rename", a.rename)
 	mux.HandleFunc("/api/seek", a.tvSeek)
 	mux.HandleFunc("/api/tv/", a.tvCommand)
 	mux.HandleFunc("/api/firewall", a.firewall)
@@ -75,8 +82,10 @@ func (a *app) uiHandler() http.Handler {
 
 func (a *app) status(w http.ResponseWriter, r *http.Request) {
 	cfg := a.cfg.get()
-	tv := map[string]any{"configured": strings.TrimSpace(cfg.TVAddr) != ""}
-	if tv["configured"].(bool) {
+	configured := strings.TrimSpace(cfg.TVAddr) != ""
+	linked := configured && !cfg.Disconnected
+	tv := map[string]any{"configured": configured, "linked": linked, "ok": false}
+	if linked {
 		if st, err := a.tv().state(); err != nil {
 			tv["ok"], tv["error"] = false, err.Error()
 		} else {
@@ -105,6 +114,7 @@ func (a *app) setConfig(w http.ResponseWriter, r *http.Request) {
 		TVAddr string `json:"tv_addr"`
 		TVPin  string `json:"tv_pin"`
 		HostIP string `json:"host_ip"`
+		Link   bool   `json:"link"` // true = "保存并连接"; absent/false only stores the values
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		fail(w, 400, err)
@@ -114,6 +124,24 @@ func (a *app) setConfig(w http.ResponseWriter, r *http.Request) {
 		c.TVAddr = strings.TrimSpace(in.TVAddr)
 		c.TVPin = strings.TrimSpace(in.TVPin)
 		c.HostIP = strings.TrimSpace(in.HostIP)
+		if in.Link {
+			c.Disconnected = false
+		}
+	})
+	if err != nil {
+		fail(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// disconnect stops talking to the TV but keeps the address and PIN on disk, so reconnecting later
+// needs no re-typing. It does not stop what the TV is already playing (use "停止" for that).
+func (a *app) disconnect(w http.ResponseWriter, r *http.Request) {
+	err := a.cfg.update(func(c *config) {
+		if strings.TrimSpace(c.TVAddr) != "" {
+			c.Disconnected = true
+		}
 	})
 	if err != nil {
 		fail(w, 500, err)
@@ -193,6 +221,27 @@ func (a *app) playLive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"url": u})
+}
+
+// rename changes the TV's advertised name. Phones see it in their cast list after the TV re-announces.
+func (a *app) rename(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		fail(w, 400, err)
+		return
+	}
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		fail(w, 400, fmt.Errorf("名字不能为空"))
+		return
+	}
+	if err := a.tv().rename(name); err != nil {
+		fail(w, 502, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "device": name})
 }
 
 func (a *app) tvCommand(w http.ResponseWriter, r *http.Request) {

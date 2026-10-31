@@ -44,7 +44,11 @@
     <label for="tvpin">口令（电视主界面上显示的 4 位数）</label>
     <input id="tvpin" inputmode="numeric" maxlength="8" placeholder="4 位口令" autocomplete="off">
     <div class="row"><button id="save" class="primary">保存并连接</button></div>
-    <div class="muted" id="tvremember" style="margin-top:8px; display:none;">已记住本机地址与口令（存于本机 EasyCast/pc.json，重启后仍保留）。电视口令现在不会每天变，每天直接推送即可，无需重新填写。</div>
+    <div class="row" id="namerow" style="display:none">
+      <input id="tvname" maxlength="30" placeholder="投屏名字（手机投屏列表里显示的名字）" autocomplete="off">
+      <button id="rename">改名</button>
+    </div>
+    <div class="muted" id="tvremember" style="margin-top:8px; display:none;">已记住本机地址与口令（存于本机 EasyCast/pc.json，重启后仍保留）。想换口令时在电视主界面点「更换口令」，再回这里重填一次并保存。</div>
   </div>
 
   <div class="card">
@@ -113,6 +117,7 @@
 <script>
 var $ = function (id) { return document.getElementById(id); };
 var loaded = false;
+var TV = {}; // last /api/status tv block, used by the 保存/断开 button
 
 function say(text, bad) { var m = $('msg'); m.textContent = text || ''; m.className = bad ? 'err' : 'ok'; }
 
@@ -135,7 +140,7 @@ function saveBox() {
   return api('/api/config', { tv_addr: a, tv_pin: $('tvpin').value.trim(), host_ip: $('hostip').value.trim() });
 }
 
-var STATES = { PLAYING: '播放中', PAUSED_PLAYBACK: '已暂停', TRANSITIONING: '加载中', STOPPED: '空闲' };
+var STATES = { PLAYING: '播放中', PAUSED_PLAYBACK: '已暂停', TRANSITIONING: '加载中', STOPPED: '空闲（没有在播放）' };
 
 function refresh() {
   fetch('/api/status').then(function (r) { return r.json(); }).then(function (s) {
@@ -152,11 +157,22 @@ function refresh() {
     $('mport').textContent = s.media_port;
     $('rtmp').textContent = s.rtmp_url;
 
+    // Say "已连接 / 未连接" in words, because the playback state (空闲) says nothing about the link.
     var d = $('tvdot'), info = $('tvinfo');
-    if (!s.tv.configured) { d.className = 'dot'; info.textContent = '未设置'; $('tvremember').style.display = 'none'; }
-    else if (s.tv.ok) { d.className = 'dot ok'; info.textContent = '已连接：' + s.tv.device + '　状态：' + (STATES[s.tv.state] || s.tv.state); }
-    else { d.className = 'dot bad'; info.textContent = s.tv.error; }
-    $('tvremember').style.display = s.tv.configured ? 'block' : 'none';
+    TV = s.tv || {};
+    if (!TV.configured) { d.className = 'dot'; info.textContent = '未连接 · 还没有填电视地址和口令'; }
+    else if (!TV.linked) { d.className = 'dot'; info.textContent = '未连接 · 已断开（地址和口令已保留，点「保存并连接」重新连上）'; }
+    else if (TV.ok) { d.className = 'dot ok'; info.textContent = '已连接 · ' + (TV.device || '电视') + '（' + (s.config.tv_addr || '') + '） · 播放状态：' + (STATES[TV.state] || TV.state); }
+    else { d.className = 'dot bad'; info.textContent = '未连接 · ' + TV.error; }
+    $('tvremember').style.display = TV.configured ? 'block' : 'none';
+
+    var btn = $('save'), on = TV.configured && TV.linked;
+    btn.textContent = on ? '断开连接' : '保存并连接';
+    btn.className = on ? 'danger' : 'primary';
+
+    // Renaming needs the link: the name is saved on the TV and re-announced from there.
+    $('namerow').style.display = TV.ok ? 'flex' : 'none';
+    if (TV.ok && document.activeElement !== $('tvname')) $('tvname').value = TV.device || '';
 
     showProgress(s.tv);
 
@@ -167,9 +183,28 @@ function refresh() {
 }
 
 $('save').onclick = function () {
+  if (TV.configured && TV.linked) {
+    run('断开连接', api('/api/disconnect')).then(refresh);
+    return;
+  }
+  run('保存并连接', api('/api/config', { tv_addr: $('tvaddr').value, tv_pin: $('tvpin').value, host_ip: $('hostip').value, link: true })).then(refresh);
+};
+// The 网络 card's button only stores the values; it must not toggle the connection.
+$('savehost').onclick = function () {
   run('保存', api('/api/config', { tv_addr: $('tvaddr').value, tv_pin: $('tvpin').value, host_ip: $('hostip').value })).then(refresh);
 };
-$('savehost').onclick = $('save').onclick;
+// Rename the TV (shown in phone cast lists). Saved on the TV, so it survives restarts of both ends.
+$('rename').onclick = function () {
+  var name = $('tvname').value.trim();
+  if (!name) { say('请先填投屏名字', true); return; }
+  say('改名…');
+  api('/api/rename', { name: name }).then(function (j) {
+    say('已改名为「' + (j.device || name) + '」——手机投屏列表里会显示新名字，没变就退出投屏搜索再进一次');
+    $('tvname').blur();
+    return refresh();
+  }).catch(function (e) { say(e.message, true); });
+};
+$('tvname').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('rename').click(); });
 // Show the address a registered file can be played from (also used by VLC, a browser, a phone).
 function showLink(url) {
   $('fileurl').textContent = url;

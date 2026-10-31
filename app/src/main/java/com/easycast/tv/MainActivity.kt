@@ -63,9 +63,13 @@ class MainActivity : Activity(), DlnaService.Ui {
     private var aspect = 0f
     private var currentStatus: String? = null
     private var attached: DlnaService? = null
-    private var logEnabled = true
+    /** false = the cast list ("最近投屏", the default view); true = the on-screen log. */
+    private var logEnabled = false
     private var logRenderPending = false
     private val wifi by lazy { WifiHelper(this) }
+
+    /** The last button switches views, so its label names the view it leads to. */
+    private fun logButtonText() = if (logEnabled) "最近投屏" else "查看日志"
 
     private companion object {
         const val REQ_LOCATION = 1
@@ -75,7 +79,6 @@ class MainActivity : Activity(), DlnaService.Ui {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         surface = SurfaceView(this)
@@ -183,6 +186,7 @@ class MainActivity : Activity(), DlnaService.Ui {
             it.player.clearVideoSurfaceView(surface)
         }
         attached = null
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }
 
@@ -197,6 +201,7 @@ class MainActivity : Activity(), DlnaService.Ui {
         }
         attached = svc
         svc.ui = this
+        onPlaybackActive(svc.isPlaybackActive())
         svc.player.setVideoSurfaceView(surface)
         aspect = svc.aspect
         onStatus(svc.status)
@@ -213,6 +218,17 @@ class MainActivity : Activity(), DlnaService.Ui {
     override fun onAspect(aspect: Float) {
         this.aspect = aspect
         fitSurface()
+    }
+
+    /**
+     * Keep the screen on only while a video is actually playing. When idle the flag is cleared so
+     * the TV sleeps normally — holding it forever is what left the panel black and unresponsive
+     * after the TV's own standby kicked in (Android thought the screen was on, so the power key
+     * could not bring it back).
+     */
+    override fun onPlaybackActive(active: Boolean) {
+        if (active) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
     /** Idle: header + log + buttons. Busy: centered status text. Playing: video only. */
@@ -233,7 +249,7 @@ class MainActivity : Activity(), DlnaService.Ui {
         val ip = if (svc!!.localIp == "0.0.0.0") "未获取" else svc.localIp
         infoView.text = "设备名：${svc.deviceName}        网络：${svc.networkLabel()}        IP：$ip" +
             if (svc.localIp == "0.0.0.0") "" else
-                "\n电脑浏览器推送：http://${svc.localIp}:${DlnaRenderer.HTTP_PORT}        口令：${svc.webPin}（不会自动更换，可在主界面点「更换口令」手动更换）"
+                "\n电脑浏览器推送：http://${svc.localIp}:${DlnaRenderer.HTTP_PORT}        口令：${svc.webPin}（可在主界面点「更换口令」手动更换）"
         noticeView.text = notice
         noticeView.visibility = if (notice != null) View.VISIBLE else View.GONE
 
@@ -271,9 +287,9 @@ class MainActivity : Activity(), DlnaService.Ui {
             },
             "更换口令" to { attached?.let { confirmNewPin(it) } },
             // Keep this one last: its click handler finds itself with buttons.last().
-            "隐藏日志" to {
+            logButtonText() to {
                 logEnabled = !logEnabled
-                buttons.last().text = if (logEnabled) "隐藏日志" else "显示日志"
+                buttons.last().text = logButtonText()
                 refreshUi()
             },
         )

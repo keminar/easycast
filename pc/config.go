@@ -16,6 +16,9 @@ type config struct {
 	MediaPort  int    `json:"media_port"`  // HTTP port the TV pulls files and live streams from
 	RTMPListen string `json:"rtmp_listen"` // where OBS publishes to
 	UIPort     int    `json:"ui_port"`
+	// Disconnected parks the saved address and PIN without contacting the TV (the "断开连接" button).
+	// Zero value = connected, so pc.json files written before this field existed keep working.
+	Disconnected bool `json:"disconnected"`
 }
 
 func defaultConfig() config {
