@@ -373,9 +373,6 @@ class DlnaRenderer(
 
     // ---------------------------------------------------------------- web page API
 
-    private var pinFails = 0
-    private var pinLockedUntil = 0L
-
     private fun parseForm(s: String): Map<String, String> =
         s.split('&').filter { '=' in it }.associate {
             val k = java.net.URLDecoder.decode(it.substringBefore('='), "UTF-8")
@@ -390,17 +387,9 @@ class DlnaRenderer(
 
     /** Returns (HTTP status, JSON body). The page must send the PIN shown on the TV with every call. */
     private fun handleApi(path: String, params: Map<String, String>, from: String?): Pair<String, String> {
-        synchronized(this) {
-            if (System.currentTimeMillis() < pinLockedUntil) return "429 Too Many Requests" to error("口令错误次数过多，请 1 分钟后再试")
-            if (webPin.isNotEmpty() && params["pin"] != webPin) {
-                AppLog.w("网页推送口令错误，来自 $from")
-                if (++pinFails >= 5) {
-                    pinFails = 0
-                    pinLockedUntil = System.currentTimeMillis() + 60_000
-                }
-                return "403 Forbidden" to error("口令不对（口令每天自动更换，请看电视主界面上的新口令）")
-            }
-            pinFails = 0
+        if (webPin.isNotEmpty() && params["pin"] != webPin) {
+            AppLog.w("网页推送口令错误，来自 $from")
+            return "403 Forbidden" to error("口令不对，请看电视主界面上的口令")
         }
         return when (path) {
             "/api/state" ->

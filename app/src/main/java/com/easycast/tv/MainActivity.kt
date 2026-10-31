@@ -96,9 +96,6 @@ class MainActivity : Activity(), DlnaService.Ui {
 
         // Make sure the background service is up (it normally already is).
         startForegroundService(Intent(this, DlnaService::class.java))
-        // Opening the app from the launcher counts as starting it: pick up a day change now.
-        // (If the service is not up yet, its own start does the check.)
-        DlnaService.instance?.checkPin()
     }
 
     private fun buildIdleLayout(): LinearLayout {
@@ -236,7 +233,7 @@ class MainActivity : Activity(), DlnaService.Ui {
         val ip = if (svc!!.localIp == "0.0.0.0") "未获取" else svc.localIp
         infoView.text = "设备名：${svc.deviceName}        网络：${svc.networkLabel()}        IP：$ip" +
             if (svc.localIp == "0.0.0.0") "" else
-                "\n电脑浏览器推送：http://${svc.localIp}:${DlnaRenderer.HTTP_PORT}        口令：${svc.webPin}（每天自动更换）"
+                "\n电脑浏览器推送：http://${svc.localIp}:${DlnaRenderer.HTTP_PORT}        口令：${svc.webPin}（不会自动更换，可在主界面点「更换口令」手动更换）"
         noticeView.text = notice
         noticeView.visibility = if (notice != null) View.VISIBLE else View.GONE
 

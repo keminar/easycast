@@ -26,9 +26,6 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
  * Keeps the DLNA renderer alive in the background (and after boot) so the TV shows up in
@@ -52,7 +49,6 @@ class DlnaService : Service(), RendererListener {
         private const val KEY_NAME = "device_name"
         const val MAX_NAME_LENGTH = 30
         private const val KEY_PIN = "web_pin"
-        private const val KEY_PIN_DAY = "web_pin_day" // yyyyMMdd on which the PIN was created
         private const val KEY_CASTS = "recent_casts"
         private const val MAX_CASTS = 5
     }
@@ -160,7 +156,7 @@ class DlnaService : Service(), RendererListener {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         webPin = prefs.getString(KEY_PIN, null)?.takeIf { it.length == 4 }
             ?: (1000..9999).random().toString().also {
-                prefs.edit().putString(KEY_PIN, it).putString(KEY_PIN_DAY, today()).apply()
+                prefs.edit().putString(KEY_PIN, it).apply()
             }
         renderer = DlnaRenderer(this, deviceName, webPin, this)
         renderer.start()
@@ -169,7 +165,6 @@ class DlnaService : Service(), RendererListener {
         setStatus(idleText())
         instance = this
         main.post(ticker)
-        checkPin() // the one automatic check: when the app starts
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
@@ -265,30 +260,15 @@ class DlnaService : Service(), RendererListener {
     fun idleText() =
         if (renderer.localIp == "0.0.0.0") "网络未连接，等待连接 Wi-Fi 或网线…" else IDLE_STATUS
 
-    private fun today(): String = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
-
     /** Replaces the web PIN with a new random one (different from the old). The old one stops working at once. */
     fun regeneratePin(reason: String = "手动更换") {
         val pin = PinPolicy.newPin(webPin)
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putString(KEY_PIN, pin).putString(KEY_PIN_DAY, today()).apply()
+            .putString(KEY_PIN, pin).apply()
         webPin = pin
         renderer.webPin = pin
         AppLog.i("网页口令已更换（$reason）")
         if (player.playbackState == Player.STATE_IDLE) setStatus(idleText()) // redraws the header with the new PIN
-    }
-
-    /**
-     * Replaces the PIN if it was made on an earlier day (see [PinPolicy.rotationDue]).
-     *
-     * By design this runs only when the app is started (the service starting, or the app being opened from
-     * the launcher), never on a timer: an app left running keeps its PIN. Main thread.
-     */
-    fun checkPin() {
-        val saved = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_PIN_DAY, null)
-        if (PinPolicy.rotationDue(saved, today(), playing = player.playbackState != Player.STATE_IDLE)) {
-            regeneratePin("每天自动更换")
-        }
     }
 
     /** Saves the new name and re-announces the device under it. Main thread. */

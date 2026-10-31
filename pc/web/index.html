@@ -44,6 +44,7 @@
     <label for="tvpin">口令（电视主界面上显示的 4 位数）</label>
     <input id="tvpin" inputmode="numeric" maxlength="8" placeholder="4 位口令" autocomplete="off">
     <div class="row"><button id="save" class="primary">保存并连接</button></div>
+    <div class="muted" id="tvremember" style="margin-top:8px; display:none;">已记住本机地址与口令（存于本机 EasyCast/pc.json，重启后仍保留）。电视口令现在不会每天变，每天直接推送即可，无需重新填写。</div>
   </div>
 
   <div class="card">
@@ -126,6 +127,14 @@ function api(path, body) {
 }
 function run(label, p) { say(label + '…'); return p.then(function (j) { say(label + '：成功'); return j; }).catch(function (e) { say(e.message, true); }); }
 
+// Remember the machine + PIN before pushing, so they survive a restart and daily use needs no re-typing.
+// Skips the save when the box is empty (keep whatever is already stored in pc.json).
+function saveBox() {
+  var a = $('tvaddr').value.trim();
+  if (!a) return Promise.resolve();
+  return api('/api/config', { tv_addr: a, tv_pin: $('tvpin').value.trim(), host_ip: $('hostip').value.trim() });
+}
+
 var STATES = { PLAYING: '播放中', PAUSED_PLAYBACK: '已暂停', TRANSITIONING: '加载中', STOPPED: '空闲' };
 
 function refresh() {
@@ -144,9 +153,10 @@ function refresh() {
     $('rtmp').textContent = s.rtmp_url;
 
     var d = $('tvdot'), info = $('tvinfo');
-    if (!s.tv.configured) { d.className = 'dot'; info.textContent = '未设置'; }
+    if (!s.tv.configured) { d.className = 'dot'; info.textContent = '未设置'; $('tvremember').style.display = 'none'; }
     else if (s.tv.ok) { d.className = 'dot ok'; info.textContent = '已连接：' + s.tv.device + '　状态：' + (STATES[s.tv.state] || s.tv.state); }
     else { d.className = 'dot bad'; info.textContent = s.tv.error; }
+    $('tvremember').style.display = s.tv.configured ? 'block' : 'none';
 
     showProgress(s.tv);
 
@@ -184,9 +194,9 @@ $('copy').onclick = function () {
 };
 $('open').onclick = function () { window.open($('fileurl').textContent, '_blank'); };
 $('playfile').onclick = function () {
-  run('推送文件', api('/api/play-file', { path: $('path').value }).then(function (j) { showLink(j.url); return j; })).then(refresh);
+  run('推送文件', saveBox().then(function () { return api('/api/play-file', { path: $('path').value }); }).then(function (j) { showLink(j.url); return j; })).then(refresh);
 };
-$('playlive').onclick = function () { run('推送 OBS 画面', api('/api/play-live')).then(refresh); };
+$('playlive').onclick = function () { run('推送 OBS 画面', saveBox().then(function () { return api('/api/play-live'); })).then(refresh); };
 $('pause').onclick = function () { run('暂停', api('/api/tv/pause')).then(refresh); };
 $('resume').onclick = function () { run('继续', api('/api/tv/resume')).then(refresh); };
 $('stop').onclick = function () { run('停止', api('/api/tv/stop')).then(refresh); };
