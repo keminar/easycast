@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.hardware.display.DisplayManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -17,6 +18,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.view.Display
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
@@ -53,6 +55,9 @@ class DlnaService : Service(), RendererListener {
         private const val KEY_PIN = "web_pin"
         private const val KEY_CASTS = "recent_casts"
         private const val MAX_CASTS = 5
+
+        /** How long to stay reachable after the screen turns off, so a cast can still wake the TV. */
+        private const val SCREEN_OFF_GRACE_MS = 10 * 60 * 1000L
     }
 
     var deviceName: String = DEFAULT_NAME
@@ -87,9 +92,14 @@ class DlnaService : Service(), RendererListener {
         private set
     private lateinit var renderer: DlnaRenderer
     private var multicastLock: WifiManager.MulticastLock? = null
-    // Partial wake lock: keeps the CPU (and therefore SSDP discovery) alive while the screen is off,
-    // WITHOUT forcing the display on — so the TV can sleep and its power key still works.
+    // Partial wake lock (CPU stays up so SSDP can answer) plus the multicast lock. Both are held only
+    // while the app really needs to be reachable — see applyPowerLocks(). Holding them through a whole
+    // idle night keeps Android from ever sleeping; this TV's own standby then powers the panel down
+    // behind Android's back, leaving a black screen whose power key does nothing.
     private var discoveryWakeLock: PowerManager.WakeLock? = null
+    private var locksHeld = false
+    private var wasInteractive = true
+    private var awakeUntil = 0L
     private var lastActive = false
     private var currentUri: String? = null
     private var pausedAt = 0L
@@ -153,17 +163,12 @@ class DlnaService : Service(), RendererListener {
         })
 
         val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-        multicastLock = wifi.createMulticastLock("easycast").apply {
-            setReferenceCounted(false); acquire()
-        }
-        // Stay reachable for casting even after the screen turns off. Partial only: does not keep
-        // the display on, so the TV still sleeps normally and the power key keeps working.
+        multicastLock = wifi.createMulticastLock("easycast").apply { setReferenceCounted(false) }
         discoveryWakeLock = (getSystemService(POWER_SERVICE) as PowerManager).newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK, "easycast:discovery"
-        ).apply {
-            setReferenceCounted(false)
-            acquire()
-        }
+        ).apply { setReferenceCounted(false) }
+        awakeUntil = SystemClock.elapsedRealtime() + SCREEN_OFF_GRACE_MS
+        applyPowerLocks(true)
 
         deviceName = getSharedPreferences(PREFS, MODE_PRIVATE)
             .getString(KEY_NAME, null)?.takeIf { it.isNotBlank() } ?: DEFAULT_NAME
@@ -196,8 +201,7 @@ class DlnaService : Service(), RendererListener {
         }
         renderer.stop()
         player.release()
-        multicastLock?.release()
-        discoveryWakeLock?.release()
+        applyPowerLocks(false)
         super.onDestroy()
     }
 
@@ -318,15 +322,47 @@ class DlnaService : Service(), RendererListener {
         )
     }
 
-    /** A cast can arrive while the TV is asleep: briefly wake the panel so the video is seen. */
+    /**
+     * A cast can arrive while the TV is asleep: briefly wake the panel so the video is seen.
+     *
+     * Checks the display itself, not only [PowerManager.isInteractive]: this TV can power its panel
+     * down while Android still believes the screen is on, and in that state a plain activity start is
+     * invisible (looks like a black screen). ACQUIRE_CAUSES_WAKEUP forces the panel back on.
+     */
     @Suppress("DEPRECATION")
     private fun wakeScreenIfAsleep() {
         val pm = getSystemService(POWER_SERVICE) as PowerManager
-        if (!pm.isInteractive) {
+        val dm = getSystemService(DISPLAY_SERVICE) as DisplayManager
+        val displayOn = dm.getDisplay(Display.DEFAULT_DISPLAY)?.state == Display.STATE_ON
+        if (!pm.isInteractive || !displayOn) {
             pm.newWakeLock(
                 PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
                 "easycast:cast-wake"
             ).apply { setReferenceCounted(false) }.acquire(10_000)
+        }
+    }
+
+    /**
+     * Holds the partial + multicast locks only while this app must be reachable: screen on, playing, or
+     * within [SCREEN_OFF_GRACE_MS] after the screen went off (a cast right then can still wake the TV).
+     * Afterwards they are released so Android sleeps normally — that is what keeps the panel and the
+     * power key in sync. Main thread.
+     */
+    private fun applyPowerLocks(on: Boolean) {
+        if (on == locksHeld) return
+        val wl = discoveryWakeLock ?: return
+        val mc = multicastLock ?: return
+        try {
+            if (on) {
+                wl.acquire()
+                mc.acquire()
+            } else {
+                if (wl.isHeld) wl.release()
+                if (mc.isHeld) mc.release()
+            }
+            locksHeld = on
+        } catch (e: RuntimeException) {
+            AppLog.w("切换唤醒锁失败：${e.message}")
         }
     }
 
@@ -389,6 +425,14 @@ class DlnaService : Service(), RendererListener {
                 lastActive = active
                 ui?.onPlaybackActive(active)
             }
+            // Keep the CPU up only while the screen is on, while playing, or shortly after it went off;
+            // otherwise let the TV sleep like any other app (see applyPowerLocks).
+            val interactive = (getSystemService(POWER_SERVICE) as PowerManager).isInteractive
+            if (wasInteractive && !interactive) {
+                awakeUntil = SystemClock.elapsedRealtime() + SCREEN_OFF_GRACE_MS
+            }
+            wasInteractive = interactive
+            applyPowerLocks(interactive || active || SystemClock.elapsedRealtime() < awakeUntil)
             main.postDelayed(this, 500)
         }
     }
