@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -92,6 +94,14 @@ func send(t *testing.T, s *rtmp.Stream, kind byte, ts uint32, data []byte) {
 	if err := s.Write(csid, ts, msg); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func namesOf(items []playItem) []string {
+	out := make([]string, len(items))
+	for i, it := range items {
+		out[i] = it.Name
+	}
+	return out
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -342,7 +352,7 @@ func newFakeTV(t *testing.T, pin string) *fakeTV {
 func testApp(t *testing.T, tvAddr, pin string) *app {
 	cfg := &configStore{path: filepath.Join(t.TempDir(), "pc.json"), cfg: defaultConfig()}
 	cfg.cfg.TVAddr, cfg.cfg.TVPin, cfg.cfg.HostIP = tvAddr, pin, "192.168.1.4"
-	return &app{cfg: cfg, hub: newHub(), files: newFileRegistry()}
+	return &app{cfg: cfg, hub: newHub(), files: newFileRegistry(), pl: newPlaylist()}
 }
 
 func TestTVClientIgnoresSystemProxyAndChecksPin(t *testing.T) {
@@ -693,4 +703,208 @@ func TestUIRejectsForeignHostAndMissingHeader(t *testing.T) {
 	if c := try("POST", "/api/tv/stop", "127.0.0.1:9000", "1"); c == 403 {
 		t.Errorf("POST with X-EasyCast blocked: %d", c)
 	}
+}
+
+// ---------------------------------------------------------------- directory listing + sequential playback
+
+func TestListDirRegistersVideosInNaturalOrder(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"ep3.mkv", "ep1.mp4", "ep10.mkv", "notes.txt", "clip.ts"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(dir, "subdir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	a := testApp(t, "", "")
+	items, err := a.listDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Sub-directories and non-video files are skipped, and the numeric parts order naturally
+	// (ep1 before ep3 before ep10), not lexically (ep1, ep10, ep3).
+	want := []string{"clip.ts", "ep1.mp4", "ep3.mkv", "ep10.mkv"}
+	if len(items) != len(want) {
+		t.Fatalf("items = %v, want %v", namesOf(items), want)
+	}
+	for i, w := range want {
+		if items[i].Name != w {
+			t.Errorf("item %d = %q, want %q", i, items[i].Name, w)
+		}
+		if !strings.HasPrefix(items[i].URL, "http://192.168.1.4:8000/file/") {
+			t.Errorf("item %d url = %q, want a /file/ URL", i, items[i].URL)
+		}
+	}
+
+	if _, err := a.listDir(filepath.Join(dir, "notes.txt")); err == nil {
+		t.Error("a file was accepted as a directory")
+	}
+	if _, err := a.listDir(t.TempDir()); err == nil {
+		t.Error("an empty folder reported as having videos")
+	}
+}
+
+// statefulTV lets a test drive what /api/state reports so sequential playback can be exercised.
+type statefulTV struct {
+	*httptest.Server
+	mu     sync.Mutex
+	state  string
+	pos    int64
+	dur    int64
+	played []string
+}
+
+func newStatefulTV(t *testing.T, pin string) *statefulTV {
+	f := &statefulTV{state: "STOPPED", dur: 600000}
+	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		w.Header().Set("Content-Type", "application/json")
+		if r.PostForm.Get("pin") != pin {
+			w.WriteHeader(403)
+			_, _ = w.Write([]byte(`{"error":"口令不对"}`))
+			return
+		}
+		switch r.URL.Path {
+		case "/api/play":
+			f.mu.Lock()
+			f.played = append(f.played, r.PostForm.Get("url"))
+			f.state, f.pos = "PLAYING", 0
+			f.mu.Unlock()
+		case "/api/state":
+			f.mu.Lock()
+			st, p, d := f.state, f.pos, f.dur
+			f.mu.Unlock()
+			fmt.Fprintf(w, `{"state":%q,"uri":"x","device":"TV","ip":"1.2.3.4","pos":%d,"dur":%d,"seekable":true}`, st, p, d)
+			return
+		case "/api/stop":
+			f.mu.Lock()
+			f.state, f.pos = "STOPPED", 0
+			f.mu.Unlock()
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(f.Close)
+	return f
+}
+
+func (f *statefulTV) endCurrent() {
+	f.mu.Lock()
+	f.state, f.pos = "STOPPED", f.dur // natural end: position left at the duration
+	f.mu.Unlock()
+}
+func (f *statefulTV) playedURLs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.played))
+	copy(out, f.played)
+	return out
+}
+
+func TestSequentialPlaybackPlaysInOrderAndAdvances(t *testing.T) {
+	old := playlistPoll
+	playlistPoll = 30 * time.Millisecond
+	defer func() { playlistPoll = old }()
+
+	tv := newStatefulTV(t, "1234")
+	a := testApp(t, strings.TrimPrefix(tv.URL, "http://"), "1234")
+
+	dir := t.TempDir()
+	for _, name := range []string{"a.mp4", "b.mp4", "c.mp4"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := a.listDir(dir)
+	if err != nil || len(items) != 3 {
+		t.Fatalf("listDir = %v, %v", items, err)
+	}
+
+	if err := a.startPlaylist(items); err != nil {
+		t.Fatalf("startPlaylist: %v", err)
+	}
+	defer a.stopPlaylist()
+
+	// First item plays right away; the watcher must observe it playing before we "finish" it.
+	waitFor(t, "first item played", func() bool { return len(tv.playedURLs()) >= 1 })
+	if got := tv.playedURLs()[0]; got != items[0].URL {
+		t.Fatalf("first played %q, want %q", got, items[0].URL)
+	}
+	// Give the watcher a few polls to confirm PLAYING (otherwise the end could look like a pre-play blip).
+	waitFor(t, "watcher saw item 0 playing", func() bool {
+		a.pl.mu.Lock()
+		defer a.pl.mu.Unlock()
+		return a.pl.playing
+	})
+	for i := 1; i < len(items); i++ {
+		tv.endCurrent()
+		waitFor(t, "item "+string(rune('1'+i))+" played", func() bool { return len(tv.playedURLs()) >= i+1 })
+		if got := tv.playedURLs()[i]; got != items[i].URL {
+			t.Fatalf("item %d played %q, want %q", i, got, items[i].URL)
+		}
+		waitFor(t, "watcher saw item "+string(rune('1'+i))+" playing", func() bool {
+			a.pl.mu.Lock()
+			defer a.pl.mu.Unlock()
+			return a.pl.playing
+		})
+	}
+
+	// After the last item ends, the queue deactivates on its own and stops touching the TV.
+	tv.endCurrent()
+	waitFor(t, "playlist deactivated", func() bool {
+		a.pl.mu.Lock()
+		defer a.pl.mu.Unlock()
+		return !a.pl.active
+	})
+	if n := len(tv.playedURLs()); n != 3 {
+		t.Fatalf("TV received %d plays, want 3", n)
+	}
+}
+
+func TestSequentialPlaybackStopsWhenUserStopsMidQueue(t *testing.T) {
+	old := playlistPoll
+	playlistPoll = 30 * time.Millisecond
+	defer func() { playlistPoll = old }()
+
+	tv := newStatefulTV(t, "1234")
+	a := testApp(t, strings.TrimPrefix(tv.URL, "http://"), "1234")
+
+	dir := t.TempDir()
+	for _, name := range []string{"a.mp4", "b.mp4"} {
+		_ = os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644)
+	}
+	items, _ := a.listDir(dir)
+
+	if err := a.startPlaylist(items); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "first item played", func() bool { return len(tv.playedURLs()) >= 1 })
+
+	// The user presses stop: position resets to 0, so the watcher must end the queue (not advance).
+	tv.mu.Lock()
+	tv.state, tv.pos = "STOPPED", 0
+	tv.mu.Unlock()
+
+	waitFor(t, "playlist deactivated", func() bool {
+		a.pl.mu.Lock()
+		defer a.pl.mu.Unlock()
+		return !a.pl.active
+	})
+	if n := len(tv.playedURLs()); n != 1 {
+		t.Fatalf("TV received %d plays, want 1 (no advance after a manual stop)", n)
+	}
+}
+
+func TestPlaylistStartRequiresLink(t *testing.T) {
+	a := testApp(t, "", "")
+	_ = a.cfg.update(func(c *config) { c.Disconnected = true }) // saved but not connected
+	if err := a.startPlaylist([]playItem{{Name: "x.mp4", URL: "http://h/x.mp4"}}); err == nil {
+		t.Fatal("playlist started while disconnected")
+	}
+	a.pl.mu.Lock()
+	if a.pl.active {
+		t.Error("playlist marked active while disconnected")
+	}
+	a.pl.mu.Unlock()
 }

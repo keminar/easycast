@@ -44,6 +44,24 @@ if ($f.ShowDialog($owner) -eq 'OK') { $f.FileName }
 	return strings.TrimSpace(string(bytes.TrimPrefix(out, []byte("\xef\xbb\xbf")))), nil
 }
 
+// pickFolder shows the standard Windows folder-browser dialog and returns the chosen path ("" if cancelled).
+func pickFolder() (string, error) {
+	script := `
+Add-Type -AssemblyName System.Windows.Forms
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false }
+$f = New-Object System.Windows.Forms.FolderBrowserDialog
+$f.Description = '选择要连播的视频文件夹'
+$f.ShowNewFolderButton = $false
+if ($f.ShowDialog($owner) -eq 'OK') { $f.SelectedPath }
+`
+	out, err := hidden(exec.Command("powershell", "-NoProfile", "-STA", "-Command", script)).Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(bytes.TrimPrefix(out, []byte("\xef\xbb\xbf")))), nil
+}
+
 // allowFirewall opens the media port for private networks so the TV can reach this PC. Needs administrator rights.
 func allowFirewall(port int) error {
 	name := "EasyCast media"

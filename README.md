@@ -238,7 +238,7 @@ D:\Android\platform-tools\adb.exe install -r app\build\outputs\apk\debug\app-deb
 
 ## 电脑端程序（`pc/` 目录，Go）
 
-把电脑上的本地视频、OBS 画面推到电视的单文件 Windows 程序：内置 HTTP 文件服务（支持 Range）、RTMP 接收（OBS）、HTTP-FLV 输出和一个本机控制页。详见 [pc/README.md](pc/README.md)。
+把电脑上的本地视频、OBS 画面推到电视的单文件 Windows 程序：内置 HTTP 文件服务（支持 Range）、RTMP 接收（OBS）、HTTP-FLV 输出和一个本机控制页。支持浏览视频目录、勾选后顺序推到电视连播（一个播完自动播下一个）。详见 [pc/README.md](pc/README.md)。
 
 ```powershell
 cd pc

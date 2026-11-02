@@ -22,7 +22,7 @@ func main() {
 	flag.Parse()
 
 	store := openConfig()
-	a := &app{cfg: store, hub: newHub(), files: newFileRegistry()}
+	a := &app{cfg: store, hub: newHub(), files: newFileRegistry(), pl: newPlaylist()}
 	cfg := store.get()
 
 	// RTMP: OBS publishes here.

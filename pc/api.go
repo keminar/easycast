@@ -16,6 +16,7 @@ type app struct {
 	cfg   *configStore
 	hub   *hub
 	files *fileRegistry
+	pl    *playlist // sequential directory playback
 }
 
 // tv returns the client for the saved TV. After "断开连接" the address is empty on purpose, so every
@@ -61,6 +62,10 @@ func (a *app) uiHandler() http.Handler {
 	mux.HandleFunc("/api/seek", a.tvSeek)
 	mux.HandleFunc("/api/tv/", a.tvCommand)
 	mux.HandleFunc("/api/firewall", a.firewall)
+	mux.HandleFunc("/api/pick-folder", a.pickFolder)
+	mux.HandleFunc("/api/list-dir", a.listDirHandler)
+	mux.HandleFunc("/api/playlist-start", a.playlistStart)
+	mux.HandleFunc("/api/playlist-stop", a.playlistStop)
 
 	port := a.cfg.get().UIPort
 	allowed := map[string]bool{
@@ -106,6 +111,7 @@ func (a *app) status(w http.ResponseWriter, r *http.Request) {
 		"obs_key":    "tv",
 		"live":       a.hub.info(),
 		"tv":         tv,
+		"playlist":   a.playlistInfo(),
 	})
 }
 

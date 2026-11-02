@@ -71,6 +71,22 @@
   </div>
 
   <div class="card">
+    <h2>视频目录 · 顺序播放</h2>
+    <div class="row">
+      <input id="dir" placeholder="选择一个视频文件夹（如 D:\视频\剧集）">
+      <button id="pickdir">浏览文件夹…</button>
+      <button id="listdir" class="primary">列出视频</button>
+    </div>
+    <div class="muted" style="margin-top:6px">列出文件夹里的视频（不含子目录），勾选要播的，点「顺序播放」依次推到电视，一个播完自动播下一个。</div>
+    <div id="dirlist" style="margin-top:10px"></div>
+    <div class="row" id="playlist-actions" style="display:none">
+      <button id="pl-start" class="primary">▶ 顺序播放</button>
+      <button id="pl-stop" class="danger">停止连播</button>
+    </div>
+    <div id="plstatus" class="muted" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
     <h2><span id="livedot" class="dot"></span> OBS 直播（例如腾讯视频客户端的画面）</h2>
     <ol>
       <li>OBS → 设置 → 推流：服务选「自定义」，服务器填 <code id="rtmp">…</code>，推流密钥填 <code>tv</code></li>
@@ -179,6 +195,20 @@ function refresh() {
     var live = (s.live || {}).tv || {};
     $('livedot').className = 'dot ' + (live.publishing ? 'ok' : 'wait');
     $('liveinfo').textContent = live.publishing ? '已收到 OBS 推流，当前观看者 ' + live.viewers + ' 个' : '等待 OBS 推流…';
+
+    // Sequential directory playback: show progress and switch the start/stop buttons.
+    var pl = s.playlist || {};
+    if (pl.active) {
+      $('plstatus').textContent = '正在连播 ' + (pl.index + 1) + ' / ' + pl.count + '：' + (pl.current || '');
+      $('pl-start').style.display = 'none';
+      $('pl-stop').style.display = '';
+      $('playlist-actions').style.display = 'flex';
+    } else {
+      $('plstatus').textContent = '';
+      $('pl-stop').style.display = 'none';
+      $('pl-start').style.display = dirItems.length ? '' : 'none';
+      $('playlist-actions').style.display = dirItems.length ? 'flex' : 'none';
+    }
   }).catch(function () {});
 }
 
@@ -232,6 +262,57 @@ $('playfile').onclick = function () {
   run('推送文件', saveBox().then(function () { return api('/api/play-file', { path: $('path').value }); }).then(function (j) { showLink(j.url); return j; })).then(refresh);
 };
 $('playlive').onclick = function () { run('推送 OBS 画面', saveBox().then(function () { return api('/api/play-live'); })).then(refresh); };
+
+// ---------------------------------------------------------------- directory sequential playback
+var dirItems = []; // [{name, url}], in display order
+
+function renderDirList() {
+  var box = $('dirlist');
+  box.textContent = '';
+  if (!dirItems.length) { $('playlist-actions').style.display = 'none'; return; }
+  var ul = document.createElement('div');
+  ul.style.cssText = 'display:flex;flex-direction:column;gap:4px';
+  dirItems.forEach(function (it, i) {
+    var row = document.createElement('label');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:14px;color:#ddd;cursor:pointer';
+    var cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = true; cb.dataset.i = i;
+    var span = document.createElement('span');
+    span.textContent = (i + 1) + '. ' + it.name;
+    row.appendChild(cb); row.appendChild(span);
+    ul.appendChild(row);
+  });
+  box.appendChild(ul);
+  $('playlist-actions').style.display = 'flex';
+  $('pl-start').style.display = '';
+  $('pl-stop').style.display = 'none';
+}
+
+$('pickdir').onclick = function () {
+  api('/api/pick-folder').then(function (j) { if (j.path) { $('dir').value = j.path; listDir(); } })
+    .catch(function (e) { say(e.message, true); });
+};
+function listDir() {
+  var p = $('dir').value.trim();
+  if (!p) { say('请先选择视频文件夹', true); return; }
+  run('列出视频', api('/api/list-dir', { path: p })).then(function (j) {
+    dirItems = j.items || [];
+    renderDirList();
+    if (dirItems.length) say('找到 ' + dirItems.length + ' 个视频');
+  });
+}
+$('listdir').onclick = listDir;
+
+$('pl-start').onclick = function () {
+  var rows = $('dirlist').querySelectorAll('input[type=checkbox]');
+  var items = [];
+  rows.forEach(function (cb) { if (cb.checked) items.push(dirItems[+cb.dataset.i]); });
+  if (!items.length) { say('请至少勾选一个视频', true); return; }
+  saveBox().then(function () {
+    return run('顺序播放', api('/api/playlist-start', { items: items }));
+  }).then(refresh);
+};
+$('pl-stop').onclick = function () { run('停止连播', api('/api/playlist-stop')).then(refresh); };
 $('pause').onclick = function () { run('暂停', api('/api/tv/pause')).then(refresh); };
 $('resume').onclick = function () { run('继续', api('/api/tv/resume')).then(refresh); };
 $('stop').onclick = function () { run('停止', api('/api/tv/stop')).then(refresh); };
