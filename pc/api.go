@@ -62,7 +62,8 @@ func (a *app) uiHandler() http.Handler {
 	mux.HandleFunc("/api/seek", a.tvSeek)
 	mux.HandleFunc("/api/tv/", a.tvCommand)
 	mux.HandleFunc("/api/firewall", a.firewall)
-	mux.HandleFunc("/api/pick-folder", a.pickFolder)
+	mux.HandleFunc("/api/browse", a.browse)
+	mux.HandleFunc("/api/last-dir", a.setLastDir)
 	mux.HandleFunc("/api/list-dir", a.listDirHandler)
 	mux.HandleFunc("/api/playlist-start", a.playlistStart)
 	mux.HandleFunc("/api/playlist-stop", a.playlistStop)
@@ -116,6 +117,12 @@ func (a *app) status(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) setConfig(w http.ResponseWriter, r *http.Request) {
+	// GET returns the saved values only: no TV probe, so the page can fill in the address and PIN
+	// the moment it opens instead of waiting for a slow, possibly failing connect attempt.
+	if r.Method == http.MethodGet {
+		writeJSON(w, 200, a.cfg.get())
+		return
+	}
 	var in struct {
 		TVAddr string `json:"tv_addr"`
 		TVPin  string `json:"tv_pin"`
@@ -135,6 +142,33 @@ func (a *app) setConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 	if err != nil {
+		fail(w, 500, err)
+		return
+	}
+	// "保存并连接" must tell the truth: saving the address always works, but the link only
+	// succeeds when the TV actually answers. Probe it here so the page can say
+	// "已保存，但连接失败：原因" instead of a blanket success.
+	resp := map[string]any{"ok": true}
+	if in.Link {
+		if st, err := a.tv().state(); err != nil {
+			resp["connected"], resp["error"] = false, err.Error()
+		} else {
+			resp["connected"], resp["device"] = true, st["device"]
+		}
+	}
+	writeJSON(w, 200, resp)
+}
+
+// setLastDir remembers the folder the user most recently browsed, so the picker reopens there.
+func (a *app) setLastDir(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Dir string `json:"dir"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		fail(w, 400, err)
+		return
+	}
+	if err := a.cfg.update(func(c *config) { c.LastDir = strings.TrimSpace(in.Dir) }); err != nil {
 		fail(w, 500, err)
 		return
 	}

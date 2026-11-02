@@ -32,7 +32,7 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>EasyCast 电脑端</h1>
+  <h1>EasyCast 电脑端 <span style="font-size:12px;color:#5a5a5a;font-weight:400;vertical-align:middle">v2026-11-03b</span></h1>
   <div class="sub">把本地视频、OBS 画面推送到电视上的「简易投屏」</div>
   <div id="msg"></div>
 
@@ -73,11 +73,11 @@
   <div class="card">
     <h2>视频目录 · 顺序播放</h2>
     <div class="row">
-      <input id="dir" placeholder="选择一个视频文件夹（如 D:\视频\剧集）">
-      <button id="pickdir">浏览文件夹…</button>
+      <input id="dir" placeholder="视频文件夹（可直接粘贴路径，或点「浏览…」）">
+      <button id="pickdir">浏览…</button>
       <button id="listdir" class="primary">列出视频</button>
     </div>
-    <div class="muted" style="margin-top:6px">列出文件夹里的视频（不含子目录），勾选要播的，点「顺序播放」依次推到电视，一个播完自动播下一个。</div>
+    <div class="muted" style="margin-top:6px">点「浏览…」在本页面内逐级选文件夹（不弹系统窗口，也不会被浏览器挡住）；选好文件夹后，里面的视频（不含子目录）会按文件名顺序依次推到电视，一个播完自动播下一个。</div>
     <div id="dirlist" style="margin-top:10px"></div>
     <div class="row" id="playlist-actions" style="display:none">
       <button id="pl-start" class="primary">▶ 顺序播放</button>
@@ -130,10 +130,28 @@
   </div>
 </div>
 
+<div id="browser-modal" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,.65); z-index:1000;">
+  <div style="max-width:680px; margin:6vh auto; background:#1a1a1a; border:1px solid #333; border-radius:12px; padding:16px; max-height:86vh; display:flex; flex-direction:column;">
+    <h2 id="bk-title" style="font-size:16px; margin:0 0 10px;">选择文件夹</h2>
+    <div class="row" style="margin-top:0">
+      <button id="bk-up">↑ 上一级</button>
+      <code id="bk-path" style="flex:1; word-break:break-all; user-select:text"></code>
+    </div>
+    <div id="bk-list" style="overflow:auto; flex:1; margin-top:10px; min-height:140px;"></div>
+    <div class="row">
+      <button id="bk-pick" class="primary">选择此文件夹</button>
+      <button id="bk-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
 <script>
 var $ = function (id) { return document.getElementById(id); };
 var loaded = false;
 var TV = {}; // last /api/status tv block, used by the 保存/断开 button
+// "Connected" means the saved TV not only exists but answers right now; an unreachable TV is
+// reported as not connected so the main button turns back into a connect button.
+function isConnected() { return !!(TV.configured && TV.linked && TV.ok); }
 
 function say(text, bad) { var m = $('msg'); m.textContent = text || ''; m.className = bad ? 'err' : 'ok'; }
 
@@ -158,14 +176,25 @@ function saveBox() {
 
 var STATES = { PLAYING: '播放中', PAUSED_PLAYBACK: '已暂停', TRANSITIONING: '加载中', STOPPED: '空闲（没有在播放）' };
 
+// Fill the boxes from the saved config. Called twice on purpose: once right away from the fast
+// config endpoint (so the address and PIN show up immediately, even while the TV probe is still
+// hanging on a dead TV), and again from /api/status as a fallback if that first call failed.
+function fillFromConfig(c) {
+  if (!c || loaded) return;
+  $('tvaddr').value = c.tv_addr || '';
+  $('tvpin').value = c.tv_pin || '';
+  $('hostip').value = c.host_ip || '';
+  lastBrowsed = c.last_dir || '';
+  $('dir').value = lastBrowsed;
+  loaded = true;
+}
+
+var busy = false, again = false; // one status poll at a time; a request during a poll re-runs it once
 function refresh() {
+  if (busy) { again = true; return; }
+  busy = true;
   fetch('/api/status').then(function (r) { return r.json(); }).then(function (s) {
-    if (!loaded) {
-      $('tvaddr').value = s.config.tv_addr || '';
-      $('tvpin').value = s.config.tv_pin || '';
-      $('hostip').value = s.config.host_ip || '';
-      loaded = true;
-    }
+    fillFromConfig(s.config);
     var dl = $('ips'); dl.textContent = '';
     (s.pc_ips || []).forEach(function (ip) { var o = document.createElement('option'); o.value = ip; dl.appendChild(o); });
     $('hostip').placeholder = '自动（' + s.pc_ip + '）';
@@ -182,7 +211,10 @@ function refresh() {
     else { d.className = 'dot bad'; info.textContent = '未连接 · ' + TV.error; }
     $('tvremember').style.display = TV.configured ? 'block' : 'none';
 
-    var btn = $('save'), on = TV.configured && TV.linked;
+    // Only a TV that actually answers counts as connected: when it is unreachable (cable pulled,
+    // WiFi changed, app closed) the button must offer a retry, not "断开连接".
+    var on = isConnected();
+    var btn = $('save');
     btn.textContent = on ? '断开连接' : '保存并连接';
     btn.className = on ? 'danger' : 'primary';
 
@@ -209,15 +241,26 @@ function refresh() {
       $('pl-start').style.display = dirItems.length ? '' : 'none';
       $('playlist-actions').style.display = dirItems.length ? 'flex' : 'none';
     }
-  }).catch(function () {});
+  }).catch(function () {}).then(function () {
+    busy = false;
+    if (again) { again = false; refresh(); }
+  });
 }
 
 $('save').onclick = function () {
-  if (TV.configured && TV.linked) {
+  if (isConnected()) {
     run('断开连接', api('/api/disconnect')).then(refresh);
     return;
   }
-  run('保存并连接', api('/api/config', { tv_addr: $('tvaddr').value, tv_pin: $('tvpin').value, host_ip: $('hostip').value, link: true })).then(refresh);
+  // Saving always succeeds; connecting may not. Report the two separately.
+  say('保存并连接…');
+  api('/api/config', { tv_addr: $('tvaddr').value, tv_pin: $('tvpin').value, host_ip: $('hostip').value, link: true })
+    .then(function (j) {
+      if (j.connected) say('保存成功，已连接' + (j.device ? '：' + j.device : ''));
+      else say('保存成功，但连接失败：' + (j.error || '电视没有响应'), true);
+      return refresh();
+    })
+    .catch(function (e) { say('保存失败：' + e.message, true); });
 };
 // The 网络 card's button only stores the values; it must not toggle the connection.
 $('savehost').onclick = function () {
@@ -246,10 +289,7 @@ function makeLink() {
   return api('/api/file-link', { path: p }).then(function (j) { showLink(j.url); say(''); })
     .catch(function (e) { showLink(''); say(e.message, true); });
 }
-$('pick').onclick = function () {
-  api('/api/pick').then(function (j) { if (j.path) { $('path').value = j.path; return makeLink(); } })
-    .catch(function (e) { say(e.message, true); });
-};
+$('pick').onclick = function () { openBrowser('file', function (p) { $('path').value = p; makeLink(); }); };
 $('path').onchange = makeLink;
 $('copy').onclick = function () {
   var url = $('fileurl').textContent;
@@ -271,13 +311,16 @@ function renderDirList() {
   box.textContent = '';
   if (!dirItems.length) { $('playlist-actions').style.display = 'none'; return; }
   var ul = document.createElement('div');
-  ul.style.cssText = 'display:flex;flex-direction:column;gap:4px';
+  ul.style.cssText = 'display:flex;flex-direction:column;gap:2px;border:1px solid #292929;border-radius:8px;padding:6px 8px;max-height:320px;overflow:auto';
   dirItems.forEach(function (it, i) {
     var row = document.createElement('label');
-    row.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:14px;color:#ddd;cursor:pointer';
+    // The global `input{width:100%}` rule would stretch a checkbox across the row; pin it to a normal size.
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:14px;color:#ddd;cursor:pointer;margin:0;padding:3px 4px;border-radius:6px';
     var cb = document.createElement('input');
     cb.type = 'checkbox'; cb.checked = true; cb.dataset.i = i;
+    cb.style.cssText = 'width:16px;height:16px;padding:0;margin:0;flex:0 0 auto;accent-color:#1e88e5';
     var span = document.createElement('span');
+    span.style.cssText = 'flex:1;min-width:0;word-break:break-all';
     span.textContent = (i + 1) + '. ' + it.name;
     row.appendChild(cb); row.appendChild(span);
     ul.appendChild(row);
@@ -288,9 +331,92 @@ function renderDirList() {
   $('pl-stop').style.display = 'none';
 }
 
-$('pickdir').onclick = function () {
-  api('/api/pick-folder').then(function (j) { if (j.path) { $('dir').value = j.path; listDir(); } })
-    .catch(function (e) { say(e.message, true); });
+$('pickdir').onclick = function () { openBrowser('dir', null); };
+
+// ---------------------------------------------------------------- in-page folder browser
+// A page overlay instead of a native Windows dialog: it is always drawn above the page,
+// so it can never end up hidden behind the browser window.
+var bkMode = 'dir', bkCur = '', bkParent = '', bkOnFile = null, lastBrowsed = '';
+
+function hideBrowser() { $('browser-modal').style.display = 'none'; }
+
+function openBrowser(mode, onFile) {
+  bkMode = mode; bkOnFile = onFile || null;
+  $('bk-title').textContent = mode === 'file' ? '选择视频文件' : '选择文件夹';
+  $('bk-pick').style.display = mode === 'dir' ? '' : 'none';
+  $('browser-modal').style.display = 'block';
+  var start;
+  if (mode === 'file') {
+    // Single-file picker: prefer the folder of the file already shown in the local-video box,
+    // then the folder box, then the shared "last browsed" folder.
+    var pf = $('path').value.trim().replace(/^"|"$/g, '');
+    var pfDir = pf ? pf.replace(/[\\\/][^\\\/]*$/, '') : '';
+    start = pfDir || $('dir').value.trim() || lastBrowsed;
+  } else {
+    // Folder picker: a folder typed into the box wins; otherwise the shared folder.
+    start = $('dir').value.trim() || lastBrowsed;
+  }
+  browseDir(start);
+}
+
+// Persist the last browsed folder (debounced) so the picker reopens there next launch.
+var lastDirTimer = null;
+function saveLastDir(dir) {
+  if (!dir) return;
+  clearTimeout(lastDirTimer);
+  lastDirTimer = setTimeout(function () {
+    api('/api/last-dir', { dir: dir }).catch(function () {});
+  }, 400);
+}
+
+function browseDir(path) {
+  api('/api/browse', { path: path }).then(function (j) {
+    bkCur = j.path || '';
+    bkParent = j.parent || '';
+    // Track the shared "last browsed" folder for both pickers, but never overwrite the box:
+    // whatever the user typed there must keep priority.
+    if (bkCur) { lastBrowsed = bkCur; saveLastDir(bkCur); }
+    $('bk-path').textContent = bkCur || '此电脑';
+    $('bk-up').style.display = bkCur ? '' : 'none';
+    var box = $('bk-list'); box.textContent = '';
+    (j.dirs || []).forEach(function (d) {
+      var b = document.createElement('button');
+      b.style.cssText = 'display:block;width:100%;text-align:left;margin:2px 0;padding:7px 10px;background:#242424;border-radius:6px;word-break:break-all';
+      b.textContent = '📁 ' + d.name;
+      b.onclick = function () { browseDir(d.path); };
+      box.appendChild(b);
+    });
+    (j.videos || []).forEach(function (v) {
+      if (bkMode === 'file') {
+        var b = document.createElement('button');
+        b.style.cssText = 'display:block;width:100%;text-align:left;margin:2px 0;padding:7px 10px;background:#242424;border-radius:6px;word-break:break-all';
+        b.textContent = '🎬 ' + v.name;
+        b.onclick = function () { var f = bkOnFile; hideBrowser(); if (f) f(v.path); };
+        box.appendChild(b);
+      } else {
+        var r = document.createElement('div');
+        r.className = 'muted';
+        r.style.cssText = 'padding:7px 10px;margin:2px 0;background:#181818;border-radius:6px;word-break:break-all';
+        r.textContent = '🎬 ' + v.name;
+        box.appendChild(r);
+      }
+    });
+    if (!(j.dirs || []).length && !(j.videos || []).length) {
+      var e = document.createElement('div');
+      e.className = 'muted'; e.textContent = '（没有子文件夹或视频）';
+      box.appendChild(e);
+    }
+    $('bk-pick').disabled = !bkCur;
+  }).catch(function (e) { say(e.message, true); });
+}
+
+$('bk-up').onclick = function () { browseDir(bkParent); };
+$('bk-cancel').onclick = hideBrowser;
+$('bk-pick').onclick = function () {
+  if (!bkCur) return;
+  $('dir').value = bkCur;
+  hideBrowser();
+  listDir();
 };
 function listDir() {
   var p = $('dir').value.trim();
@@ -298,7 +424,7 @@ function listDir() {
   run('列出视频', api('/api/list-dir', { path: p })).then(function (j) {
     dirItems = j.items || [];
     renderDirList();
-    if (dirItems.length) say('找到 ' + dirItems.length + ' 个视频');
+    if (dirItems.length) { say('找到 ' + dirItems.length + ' 个视频'); lastBrowsed = p; saveLastDir(p); }
   });
 }
 $('listdir').onclick = listDir;
@@ -355,6 +481,13 @@ function showProgress(tv) {
   }
 }
 
+// Show the saved address and PIN immediately (this endpoint never touches the TV), then let the
+// slower status poll fill in the connection state.
+fetch('/api/config').then(function (r) { return r.json(); }).then(function (c) {
+  fillFromConfig(c);
+  // Say what is happening instead of leaving a blank line while the first probe is still running.
+  if ($('tvaddr').value.trim()) { $('tvdot').className = 'dot wait'; $('tvinfo').textContent = '正在连接电视…（最多等几秒）'; }
+}).catch(function () {});
 refresh();
 setInterval(refresh, 2000);
 </script>

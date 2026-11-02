@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -269,6 +270,40 @@ func (a *app) playlistInfo() map[string]any {
 
 // ---------------------------------------------------------------- helpers
 
+// browseEntry is one folder or video shown by the in-page file browser.
+type browseEntry struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+// listRoots lists the drive letters (Windows) or "/" (other) shown at the top of the browser.
+func listRoots() []browseEntry {
+	out := []browseEntry{}
+	if runtime.GOOS == "windows" {
+		for c := 'A'; c <= 'Z'; c++ {
+			p := string(c) + ":\\"
+			if _, err := os.Stat(p); err == nil {
+				out = append(out, browseEntry{Name: p, Path: p})
+			}
+		}
+		return out
+	}
+	out = append(out, browseEntry{Name: "/", Path: "/"})
+	if home, err := os.UserHomeDir(); err == nil && home != "/" {
+		out = append(out, browseEntry{Name: home, Path: home})
+	}
+	return out
+}
+
+// parentDir returns the parent folder, or "" at a drive root (so the UI can fall back to the drive list).
+func parentDir(p string) string {
+	parent := filepath.Dir(p)
+	if parent == p {
+		return ""
+	}
+	return parent
+}
+
 func toInt64(v any) int64 {
 	switch n := v.(type) {
 	case float64:
@@ -328,17 +363,51 @@ func naturalLess(a, b string) bool {
 
 // ---------------------------------------------------------------- HTTP handlers
 
-func (a *app) pickFolder(w http.ResponseWriter, r *http.Request) {
-	p, err := pickFolder()
-	if err != nil {
-		fail(w, 500, err)
-		return
+// browse powers the in-page folder picker. It returns the sub-folders and videos of the given
+// directory (or the drive list when path is empty). Rendering it inside the page means it can
+// never hide behind the browser window, unlike a native PowerShell dialog.
+func (a *app) browse(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Path string `json:"path"`
 	}
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	p := strings.Trim(strings.TrimSpace(in.Path), `"`)
 	if p == "" {
-		writeJSON(w, 200, map[string]string{"path": ""})
+		writeJSON(w, 200, map[string]any{
+			"path": "", "parent": "", "dirs": listRoots(), "videos": []browseEntry{},
+		})
 		return
 	}
-	writeJSON(w, 200, map[string]string{"path": p})
+	info, err := os.Stat(p)
+	if err != nil {
+		fail(w, 400, fmt.Errorf("无法打开：%s", p))
+		return
+	}
+	if !info.IsDir() {
+		fail(w, 400, fmt.Errorf("这不是文件夹：%s", p))
+		return
+	}
+	entries, err := os.ReadDir(p)
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
+	dirs := []browseEntry{}
+	videos := []browseEntry{}
+	for _, e := range entries {
+		name := e.Name()
+		full := filepath.Join(p, name)
+		if e.IsDir() {
+			dirs = append(dirs, browseEntry{Name: name, Path: full})
+		} else if videoExt[strings.ToLower(filepath.Ext(name))] {
+			videos = append(videos, browseEntry{Name: name, Path: full})
+		}
+	}
+	sort.Slice(dirs, func(i, j int) bool { return strings.ToLower(dirs[i].Name) < strings.ToLower(dirs[j].Name) })
+	sort.Slice(videos, func(i, j int) bool { return naturalLess(videos[i].Name, videos[j].Name) })
+	writeJSON(w, 200, map[string]any{
+		"path": p, "parent": parentDir(p), "dirs": dirs, "videos": videos,
+	})
 }
 
 func (a *app) listDirHandler(w http.ResponseWriter, r *http.Request) {

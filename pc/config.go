@@ -19,6 +19,8 @@ type config struct {
 	// Disconnected parks the saved address and PIN without contacting the TV (the "断开连接" button).
 	// Zero value = connected, so pc.json files written before this field existed keep working.
 	Disconnected bool `json:"disconnected"`
+	// LastDir remembers the last folder browsed/selected so the picker reopens there next time.
+	LastDir string `json:"last_dir"`
 }
 
 func defaultConfig() config {

@@ -626,6 +626,93 @@ func TestUIDisconnectKeepsAddressAndBlocksPush(t *testing.T) {
 	}
 }
 
+func TestUISaveAndConnectReportsWhetherTheLinkWorked(t *testing.T) {
+	tv := newFakeTV(t, "1234")
+	reachable := strings.TrimPrefix(tv.URL, "http://")
+	a := testApp(t, "", "")
+	ui := httptest.NewServer(a.uiHandler())
+	defer ui.Close()
+
+	post := func(body string) (int, map[string]any) {
+		req, _ := http.NewRequest("POST", ui.URL+"/api/config", strings.NewReader(body))
+		req.Header.Set("X-EasyCast", "1")
+		req.Host = "127.0.0.1:9000"
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out
+	}
+
+	// A reachable TV: the address is stored and the link is confirmed in one round trip.
+	code, out := post(`{"tv_addr":"` + reachable + `","tv_pin":"1234","link":true}`)
+	if code != 200 || out["connected"] != true {
+		t.Fatalf("reachable save: %d %v", code, out)
+	}
+	if _, has := out["error"]; has {
+		t.Errorf("reachable save reported an error: %v", out)
+	}
+
+	// An address nothing listens on: saving must still succeed, but say the link did not.
+	code, out = post(`{"tv_addr":"127.0.0.1:1","tv_pin":"1234","link":true}`)
+	if code != 200 || out["connected"] != false {
+		t.Fatalf("unreachable save: %d %v", code, out)
+	}
+	msg, _ := out["error"].(string)
+	if !strings.Contains(msg, "连不上电视") {
+		t.Errorf("unreachable save error = %q, want it to explain the failed link", msg)
+	}
+	// The address is kept anyway, so the user only has to fix the network and retry.
+	if got := strings.TrimSpace(a.cfg.get().TVAddr); got != "127.0.0.1:1" {
+		t.Errorf("address after failed connect = %q, want it saved", got)
+	}
+
+	// A plain 保存 (no link) must not pretend to have connected.
+	code, out = post(`{"tv_addr":"127.0.0.1:1","tv_pin":"1234","host_ip":"192.168.1.4"}`)
+	if code != 200 {
+		t.Fatalf("save without link: %d", code)
+	}
+	if _, has := out["connected"]; has {
+		t.Errorf("save without link answered with a link result: %v", out)
+	}
+}
+
+// The page must show the saved address and PIN the instant it opens, without waiting for a probe of
+// a TV that may be off. GET /api/config answers from disk only.
+func TestUIGetConfigAnswersWithoutProbingTheTV(t *testing.T) {
+	a := testApp(t, "127.0.0.1:1", "5325") // an address nothing listens on
+	a.cfg.cfg.LastDir = `D:\视频`
+
+	req := httptest.NewRequest("GET", "/api/config", nil)
+	req.Host = "127.0.0.1:9000"
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	a.uiHandler().ServeHTTP(rec, req)
+	took := time.Since(start)
+
+	if rec.Code != 200 {
+		t.Fatalf("GET /api/config: %d %s", rec.Code, rec.Body.String())
+	}
+	// A probe of a dead TV costs seconds; reading pc.json costs microseconds.
+	if took > 500*time.Millisecond {
+		t.Errorf("GET /api/config took %v, it should not wait for the TV", took)
+	}
+	var c struct {
+		TVAddr  string `json:"tv_addr"`
+		TVPin   string `json:"tv_pin"`
+		LastDir string `json:"last_dir"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.TVAddr != "127.0.0.1:1" || c.TVPin != "5325" || c.LastDir != `D:\视频` {
+		t.Errorf("GET /api/config = %+v, want the saved values back", c)
+	}
+}
+
 func TestUIRenameForwardsTrimmedNameToTV(t *testing.T) {
 	tv := newFakeTV(t, "1234")
 	a := testApp(t, strings.TrimPrefix(tv.URL, "http://"), "1234")
@@ -743,6 +830,75 @@ func TestListDirRegistersVideosInNaturalOrder(t *testing.T) {
 	}
 	if _, err := a.listDir(t.TempDir()); err == nil {
 		t.Error("an empty folder reported as having videos")
+	}
+}
+
+func TestBrowseListsFoldersAndVideos(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"b10.mp4", "b2.mkv", "note.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(dir, "子目录"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	a := testApp(t, "", "")
+	body, _ := json.Marshal(map[string]string{"path": dir})
+	rec := httptest.NewRecorder()
+	a.browse(rec, httptest.NewRequest("POST", "/api/browse", bytes.NewReader(body)))
+	if rec.Code != 200 {
+		t.Fatalf("browse status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Path   string        `json:"path"`
+		Parent string        `json:"parent"`
+		Dirs   []browseEntry `json:"dirs"`
+		Videos []browseEntry `json:"videos"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Path != dir {
+		t.Errorf("path = %q, want %q", out.Path, dir)
+	}
+	if out.Parent == "" {
+		t.Error("parent is empty for a sub-directory")
+	}
+	if len(out.Dirs) != 1 || out.Dirs[0].Name != "子目录" {
+		t.Errorf("dirs = %+v, want just 子目录", out.Dirs)
+	}
+	// note.txt is not a video; the two videos sort naturally (b2 before b10).
+	if len(out.Videos) != 2 || out.Videos[0].Name != "b2.mkv" || out.Videos[1].Name != "b10.mp4" {
+		t.Errorf("videos = %+v, want [b2.mkv b10.mp4]", out.Videos)
+	}
+
+	// Empty path returns the roots (drives on Windows, "/" elsewhere).
+	rec = httptest.NewRecorder()
+	a.browse(rec, httptest.NewRequest("POST", "/api/browse", strings.NewReader("{}")))
+	if rec.Code != 200 {
+		t.Fatalf("roots status = %d", rec.Code)
+	}
+	var roots struct {
+		Dirs []browseEntry `json:"dirs"`
+	}
+	_ = json.NewDecoder(rec.Body).Decode(&roots)
+	if len(roots.Dirs) == 0 {
+		t.Error("no roots returned for an empty path")
+	}
+}
+
+func TestLastDirIsRemembered(t *testing.T) {
+	a := testApp(t, "", "")
+	body, _ := json.Marshal(map[string]string{"dir": `D:\视频\剧集`})
+	rec := httptest.NewRecorder()
+	a.setLastDir(rec, httptest.NewRequest("POST", "/api/last-dir", bytes.NewReader(body)))
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := a.cfg.get().LastDir; got != `D:\视频\剧集` {
+		t.Errorf("LastDir = %q, want %q", got, `D:\视频\剧集`)
 	}
 }
 
